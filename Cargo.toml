@@ -3,6 +3,7 @@ members = [
 	"crates/*",
 	"bindings/jsonnet",
 	"cmds/jrsonnet",
+	"cmds/jrsonnet-fmt",
 ]
 
 [profile.test]

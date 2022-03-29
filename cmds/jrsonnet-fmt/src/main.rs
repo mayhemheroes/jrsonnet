@@ -65,7 +65,7 @@ impl Printable for FieldName {
 	fn print(&self) -> PrintItems {
 		match self {
 			FieldName::Fixed(f) => {
-				p!(new: str(&f))
+				p!(new: str(f))
 			}
 			FieldName::Dyn(_) => todo!(),
 		}
@@ -135,7 +135,7 @@ impl Printable for ArgsDesc {
 			if first.take().is_none() {
 				p!(out: str(", "));
 			}
-			p!(out: str(&n) str(" = ") {u})
+			p!(out: str(n) str(" = ") {u})
 		}
 
 		out
@@ -214,7 +214,7 @@ impl Printable for Expr {
 				let n = n.to_string();
 				p!(pi: str(&n));
 			}
-			Expr::Var(v) => p!(pi: str(&v)),
+			Expr::Var(v) => p!(pi: str(v)),
 			Expr::Arr(a) => {
 				p!(pi: str("["));
 				for (i, v) in a.iter().enumerate() {
@@ -258,7 +258,7 @@ impl Printable for Expr {
 			}
 			Expr::Import(i) => {
 				let v = i.to_str().unwrap();
-				p!(pi: str("import \"") str(&v) str("\""));
+				p!(pi: str("import \"") str(v) str("\""));
 			}
 			Expr::ImportStr(_) => todo!(),
 			Expr::ErrorStmt(_) => todo!(),
@@ -306,23 +306,23 @@ impl Printable for LocExpr {
 fn main() {
 	let parsed = jrsonnet_parser::parse(
 		r#"
-	
-	
+
+
 		# Edit me!
 		local b = import "b.libsonnet";  # comment
 		local a = import "a.libsonnet";
-		
+
 			 local f(x,y)=x+y;
-		
-		
+
+
 		local Template = {z: "foo"};
-		
+
 		Template + {
 						local
 
 					h = 3,
 					assert self.a == 1
-		  
+
 					: "error",
 		"f": ((((((3)))))) ,
 		"g g":
@@ -341,15 +341,15 @@ fn main() {
 		  ],
 		  m: a[1::],
 		  m: b[::],
-		  k: if a         == b    then 
+		  k: if a         == b    then
 
 
 		  2
 
 		  else Template {}
 		}
-		
-	
+
+
 "#,
 		&ParserSettings {
 			file_name: PathBuf::from("example").into(),
