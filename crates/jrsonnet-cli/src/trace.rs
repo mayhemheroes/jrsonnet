@@ -1,13 +1,15 @@
-use crate::ConfigureState;
+use std::str::FromStr;
+
 use clap::Parser;
 use jrsonnet_evaluator::{
 	error::Result,
 	trace::{CompactFormat, ExplainingFormat, PathResolver},
-	EvaluationState,
+	State,
 };
-use std::str::FromStr;
 
-#[derive(PartialEq)]
+use crate::ConfigureState;
+
+#[derive(PartialEq, Eq)]
 pub enum TraceFormatName {
 	Compact,
 	Explaining,
@@ -39,22 +41,26 @@ pub struct TraceOpts {
 	max_trace: usize,
 }
 impl ConfigureState for TraceOpts {
-	fn configure(&self, state: &EvaluationState) -> Result<()> {
-		let resolver = PathResolver::Absolute;
+	fn configure(&self, s: &State) -> Result<()> {
+		let resolver = if let Ok(dir) = std::env::current_dir() {
+			PathResolver::Relative(dir)
+		} else {
+			PathResolver::Absolute
+		};
 		match self
 			.trace_format
 			.as_ref()
 			.unwrap_or(&TraceFormatName::Compact)
 		{
-			TraceFormatName::Compact => state.set_trace_format(Box::new(CompactFormat {
+			TraceFormatName::Compact => s.set_trace_format(Box::new(CompactFormat {
 				resolver,
 				padding: 4,
 			})),
 			TraceFormatName::Explaining => {
-				state.set_trace_format(Box::new(ExplainingFormat { resolver }))
+				s.set_trace_format(Box::new(ExplainingFormat { resolver }))
 			}
 		}
-		state.set_max_trace(self.max_trace);
+		s.set_max_trace(self.max_trace);
 		Ok(())
 	}
 }

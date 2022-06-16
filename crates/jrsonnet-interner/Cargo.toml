@@ -6,7 +6,13 @@ authors = ["Yaroslav Bolyukin <iam@lach.pw>"]
 license = "MIT"
 edition = "2021"
 
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
 [dependencies]
-serde = { version = "1.0" }
-rustc-hash = "1.1.0"
-gcmodule = { git = "https://github.com/CertainLach/gcmodule", branch = "jrsonnet" }
+jrsonnet-gcmodule = { version = "0.3.4" }
+
+serde = { version = "1.0", optional = true }
+rustc-hash = "1.1"
+hashbrown = { version = "0.12.1", features = ["inline-more"] }

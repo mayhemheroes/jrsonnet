@@ -2,6 +2,10 @@
   local std = self,
   local id = std.id,
 
+  # Magic legacy field
+  thisFile:: $intrinsicThisFile,
+  id:: $intrinsicId,
+
   # Those functions aren't normally located in stdlib
   length:: $intrinsic(length),
   type:: $intrinsic(type),
@@ -21,7 +25,6 @@
   decodeUTF8:: $intrinsic(decodeUTF8),
   md5:: $intrinsic(md5),
   trace:: $intrinsic(trace),
-  id:: $intrinsic(id),
   parseJson:: $intrinsic(parseJson),
   parseYaml:: $intrinsic(parseYaml),
 
@@ -39,6 +42,9 @@
   exp:: $intrinsic(exp),
   mantissa:: $intrinsic(mantissa),
   exponent:: $intrinsic(exponent),
+
+  any:: $intrinsic(any),
+  all:: $intrinsic(all),
 
   isString(v):: std.type(v) == 'string',
   isNumber(v):: std.type(v) == 'number',
@@ -119,11 +125,7 @@
     assert std.length(str) > 0 : 'Not hexadecimal: ""';
     parse_nat(str, 16),
 
-  split(str, c)::
-    assert std.isString(str) : 'std.split first parameter should be a string, got ' + std.type(str);
-    assert std.isString(c) : 'std.split second parameter should be a string, got ' + std.type(c);
-    assert std.length(c) == 1 : 'std.split second parameter should have length 1, got ' + std.length(c);
-    std.splitLimit(str, c, -1),
+  split(str, c):: std.splitLimit(str, c, -1),
 
   splitLimit:: $intrinsic(splitLimit),
 

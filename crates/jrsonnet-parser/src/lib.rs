@@ -1,18 +1,18 @@
-#![allow(clippy::redundant_closure_call)]
+#![allow(clippy::redundant_closure_call, clippy::derive_partial_eq_without_eq)]
+
+use std::rc::Rc;
 
 use peg::parser;
-use std::{
-	path::{Path, PathBuf},
-	rc::Rc,
-};
 mod expr;
 pub use expr::*;
 pub use jrsonnet_interner::IStr;
 pub use peg;
+mod source;
 mod unescape;
+pub use source::Source;
 
 pub struct ParserSettings {
-	pub file_name: Rc<Path>,
+	pub file_name: Source,
 }
 
 macro_rules! expr_bin {
@@ -53,19 +53,19 @@ parser! {
 		rule number() -> f64 = quiet!{a:$(uint_str() ("." uint_str())? (['e'|'E'] (s:['+'|'-'])? uint_str())?) {? a.parse().map_err(|_| "<number>") }} / expected!("<number>")
 
 		/// Reserved word followed by any non-alphanumberic
-		rule reserved() = ("assert" / "else" / "error" / "false" / "for" / "function" / "if" / "import" / "importstr" / "in" / "local" / "null" / "tailstrict" / "then" / "self" / "super" / "true") end_of_ident()
-		rule id() = quiet!{ !reserved() alpha() (alpha() / digit())*} / expected!("<identifier>")
+		rule reserved() = ("assert" / "else" / "error" / "false" / "for" / "function" / "if" / "import" / "importstr" / "importbin" / "in" / "local" / "null" / "tailstrict" / "then" / "self" / "super" / "true") end_of_ident()
+		rule id() -> IStr = v:$(quiet!{ !reserved() alpha() (alpha() / digit())*} / expected!("<identifier>")) { v.into() }
 
 		rule keyword(id: &'static str) -> ()
 			= ##parse_string_literal(id) end_of_ident()
 
-		pub rule param(s: &ParserSettings) -> expr::Param = name:$(id()) expr:(_ "=" _ expr:expr(s){expr})? { expr::Param(name.into(), expr) }
+		pub rule param(s: &ParserSettings) -> expr::Param = name:destruct(s) expr:(_ "=" _ expr:expr(s){expr})? { expr::Param(name, expr) }
 		pub rule params(s: &ParserSettings) -> expr::ParamsDesc
 			= params:param(s) ** comma() comma()? { expr::ParamsDesc(Rc::new(params)) }
 			/ { expr::ParamsDesc(Rc::new(Vec::new())) }
 
 		pub rule arg(s: &ParserSettings) -> (Option<IStr>, LocExpr)
-			= quiet! { name:(s:$(id()) _ "=" _ {s})? expr:expr(s) {(name.map(Into::into), expr)} }
+			= quiet! { name:(s:id() _ "=" !['='] _ {s})? expr:expr(s) {(name, expr)} }
 			/ expected!("<argument>")
 
 		pub rule args(s: &ParserSettings) -> expr::ArgsDesc
@@ -88,9 +88,52 @@ parser! {
 				Ok(expr::ArgsDesc::new(unnamed, named))
 			}
 
+		pub rule destruct_rest() -> expr::DestructRest
+			= "..." into:(_ into:id() {into})? {if let Some(into) = into {
+				expr::DestructRest::Keep(into)
+			} else {expr::DestructRest::Drop}}
+		pub rule destruct_array(s: &ParserSettings) -> expr::Destruct
+			= "[" _ start:destruct(s)**comma() rest:(
+				comma() _ rest:destruct_rest()? end:(
+					comma() end:destruct(s)**comma() (_ comma())? {end}
+					/ comma()? {Vec::new()}
+				) {(rest, end)}
+				/ comma()? {(None, Vec::new())}
+			) _ "]" {?
+				#[cfg(feature = "exp-destruct")] return Ok(expr::Destruct::Array {
+					start,
+					rest: rest.0,
+					end: rest.1,
+				});
+				#[cfg(not(feature = "exp-destruct"))] Err("experimental destructuring was not enabled")
+			}
+		pub rule destruct_object(s: &ParserSettings) -> expr::Destruct
+			= "{" _
+				fields:(name:id() into:(_ ":" _ into:destruct(s) {into})? default:(_ "=" _ v:expr(s) {v})? {(name, into, default)})**comma()
+				rest:(
+					comma() rest:destruct_rest()? {rest}
+					/ comma()? {None}
+				)
+			_ "}" {?
+				#[cfg(feature = "exp-destruct")] return Ok(expr::Destruct::Object {
+					fields,
+					rest,
+				});
+				#[cfg(not(feature = "exp-destruct"))] Err("experimental destructuring was not enabled")
+			}
+		pub rule destruct(s: &ParserSettings) -> expr::Destruct
+			= v:id() {expr::Destruct::Full(v)}
+			/ "?" {?
+				#[cfg(feature = "exp-destruct")] return Ok(expr::Destruct::Skip);
+				#[cfg(not(feature = "exp-destruct"))] Err("experimental destructuring was not enabled")
+			}
+			/ arr:destruct_array(s) {arr}
+			/ obj:destruct_object(s) {obj}
+
 		pub rule bind(s: &ParserSettings) -> expr::BindSpec
-			= name:$(id()) _ "=" _ expr:expr(s) {expr::BindSpec{name:name.into(), params: None, value: expr}}
-			/ name:$(id()) _ "(" _ params:params(s) _ ")" _ "=" _ expr:expr(s) {expr::BindSpec{name:name.into(), params: Some(params), value: expr}}
+			= into:destruct(s) _ "=" _ expr:expr(s) {expr::BindSpec::Field{into, value: expr}}
+			/ name:id() _ "(" _ params:params(s) _ ")" _ "=" _ expr:expr(s) {expr::BindSpec::Function{name, params, value: expr}}
+
 		pub rule assertion(s: &ParserSettings) -> expr::AssertStmt
 			= keyword("assert") _ cond:expr(s) msg:(_ ":" _ e:expr(s) {e})? { expr::AssertStmt(cond, msg) }
 
@@ -112,7 +155,7 @@ parser! {
 			/ "\\\\"
 			/ "\\u" hex_char() hex_char() hex_char() hex_char()
 			/ "\\x" hex_char() hex_char()
-			/ ['\\'] (quiet! { ['b' | 'f' | 'n' | 'r' | 't'] / c() } / expected!("<escape character>"))
+			/ ['\\'] (quiet! { ['b' | 'f' | 'n' | 'r' | 't' | '"' | '\''] } / expected!("<escape character>"))
 		pub rule string() -> String
 			= ['"'] str:$(string_char(<"\"">)*) ['"'] {? unescape::unescape(str).ok_or("<escaped string>")}
 			/ ['\''] str:$(string_char(<"\'">)*) ['\''] {? unescape::unescape(str).ok_or("<escaped string>")}
@@ -121,7 +164,7 @@ parser! {
 			/ string_block() } / expected!("<string>")
 
 		pub rule field_name(s: &ParserSettings) -> expr::FieldName
-			= name:$(id()) {expr::FieldName::Fixed(name.into())}
+			= name:id() {expr::FieldName::Fixed(name)}
 			/ name:string() {expr::FieldName::Fixed(name.into())}
 			/ "[" _ expr:expr(s) _ "]" {expr::FieldName::Dyn(expr)}
 		pub rule visibility() -> expr::Visibility
@@ -166,11 +209,11 @@ parser! {
 		pub rule ifspec(s: &ParserSettings) -> IfSpecData
 			= keyword("if") _ expr:expr(s) {IfSpecData(expr)}
 		pub rule forspec(s: &ParserSettings) -> ForSpecData
-			= keyword("for") _ id:$(id()) _ keyword("in") _ cond:expr(s) {ForSpecData(id.into(), cond)}
+			= keyword("for") _ id:id() _ keyword("in") _ cond:expr(s) {ForSpecData(id, cond)}
 		pub rule compspec(s: &ParserSettings) -> Vec<expr::CompSpec>
 			= s:(i:ifspec(s) { expr::CompSpec::IfSpec(i) } / f:forspec(s) {expr::CompSpec::ForSpec(f)} ) ** _ {s}
 		pub rule local_expr(s: &ParserSettings) -> Expr
-			= keyword("local") _ binds:bind(s) ** comma() _ ";" _ expr:expr(s) { Expr::LocalExpr(binds, expr) }
+			= keyword("local") _ binds:bind(s) ** comma() (_ ",")? _ ";" _ expr:expr(s) { Expr::LocalExpr(binds, expr) }
 		pub rule string_expr(s: &ParserSettings) -> Expr
 			= s:string() {Expr::Str(s.into())}
 		pub rule obj_expr(s: &ParserSettings) -> Expr
@@ -186,9 +229,9 @@ parser! {
 		pub rule number_expr(s: &ParserSettings) -> Expr
 			= n:number() { expr::Expr::Num(n) }
 		pub rule var_expr(s: &ParserSettings) -> Expr
-			= n:$(id()) { expr::Expr::Var(n.into()) }
+			= n:id() { expr::Expr::Var(n) }
 		pub rule id_loc(s: &ParserSettings) -> LocExpr
-			= a:position!() n:$(id()) b:position!() { LocExpr(Rc::new(expr::Expr::Str(n.into())), ExprLocation(s.file_name.clone(), a,b)) }
+			= a:position!() n:id() b:position!() { LocExpr(Rc::new(expr::Expr::Str(n)), ExprLocation(s.file_name.clone(), a as u32,b as u32)) }
 		pub rule if_then_else_expr(s: &ParserSettings) -> Expr
 			= cond:ifspec(s) _ keyword("then") _ cond_then:expr(s) cond_else:(_ keyword("else") _ e:expr(s) {e})? {Expr::IfElse{
 				cond,
@@ -209,7 +252,9 @@ parser! {
 		pub rule expr_basic(s: &ParserSettings) -> Expr
 			= literal(s)
 
-			/ quiet!{"$intrinsic(" name:$(id()) ")" {Expr::Intrinsic(name.into())}}
+			/ quiet!{"$intrinsicThisFile" {Expr::IntrinsicThisFile}}
+			/ quiet!{"$intrinsicId" {Expr::IntrinsicId}}
+			/ quiet!{"$intrinsic(" name:id() ")" {Expr::Intrinsic(name)}}
 
 			/ string_expr(s) / number_expr(s)
 			/ array_expr(s)
@@ -217,8 +262,9 @@ parser! {
 			/ array_expr(s)
 			/ array_comp_expr(s)
 
-			/ keyword("importstr") _ path:string() {Expr::ImportStr(PathBuf::from(path))}
-			/ keyword("import") _ path:string() {Expr::Import(PathBuf::from(path))}
+			/ keyword("importstr") _ path:string() {Expr::ImportStr(path.into())}
+			/ keyword("importbin") _ path:string() {Expr::ImportBin(path.into())}
+			/ keyword("import") _ path:string() {Expr::Import(path.into())}
 
 			/ var_expr(s)
 			/ local_expr(s)
@@ -230,7 +276,7 @@ parser! {
 			/ keyword("error") _ expr:expr(s) { Expr::ErrorStmt(expr) }
 
 		rule slice_part(s: &ParserSettings) -> Option<LocExpr>
-			= e:(_ e:expr(s) _{e})? {e}
+			= _ e:(e:expr(s) _{e})? {e}
 		pub rule slice_desc(s: &ParserSettings) -> SliceDesc
 			= start:slice_part(s) ":" pair:(end:slice_part(s) step:(":" e:slice_part(s){e})? {(end, step.flatten())})? {
 				let (end, step) = if let Some((end, step)) = pair {
@@ -252,7 +298,7 @@ parser! {
 		use UnaryOpType::*;
 		rule expr(s: &ParserSettings) -> LocExpr
 			= precedence! {
-				start:position!() v:@ end:position!() { LocExpr(Rc::new(v), ExprLocation(s.file_name.clone(), start, end)) }
+				start:position!() v:@ end:position!() { LocExpr(Rc::new(v), ExprLocation(s.file_name.clone(), start as u32, end as u32)) }
 				--
 				a:(@) _ binop(<"||">) _ b:@ {expr_bin!(a Or b)}
 				--
@@ -310,23 +356,25 @@ pub fn string_to_expr(str: IStr, settings: &ParserSettings) -> LocExpr {
 	let len = str.len();
 	LocExpr(
 		Rc::new(Expr::Str(str)),
-		ExprLocation(settings.file_name.clone(), 0, len),
+		ExprLocation(settings.file_name.clone(), 0, len as u32),
 	)
 }
 
 #[cfg(test)]
 pub mod tests {
-	use super::{expr::*, parse};
-	use crate::ParserSettings;
-	use std::path::PathBuf;
+	use std::borrow::Cow;
+
 	use BinaryOpType::*;
+
+	use super::{expr::*, parse};
+	use crate::{source::Source, ParserSettings};
 
 	macro_rules! parse {
 		($s:expr) => {
 			parse(
 				$s,
 				&ParserSettings {
-					file_name: PathBuf::from("test.jsonnet").into(),
+					file_name: Source::new_virtual(Cow::Borrowed("<test>")),
 				},
 			)
 			.unwrap()
@@ -337,7 +385,7 @@ pub mod tests {
 		($expr:expr, $from:expr, $to:expr$(,)?) => {
 			LocExpr(
 				std::rc::Rc::new($expr),
-				ExprLocation(PathBuf::from("test.jsonnet").into(), $from, $to),
+				ExprLocation(Source::new_virtual(Cow::Borrowed("<test>")), $from, $to),
 			)
 		};
 	}
@@ -404,11 +452,15 @@ pub mod tests {
 	fn imports() {
 		assert_eq!(
 			parse!("import \"hello\""),
-			el!(Expr::Import(PathBuf::from("hello")), 0, 14),
+			el!(Expr::Import("hello".into()), 0, 14),
 		);
 		assert_eq!(
 			parse!("importstr \"garnish.txt\""),
-			el!(Expr::ImportStr(PathBuf::from("garnish.txt")), 0, 23)
+			el!(Expr::ImportStr("garnish.txt".into()), 0, 23)
+		);
+		assert_eq!(
+			parse!("importbin \"garnish.bin\""),
+			el!(Expr::ImportBin("garnish.bin".into()), 0, 23)
 		);
 	}
 
@@ -671,12 +723,10 @@ pub mod tests {
 	fn add_location_info_to_all_sub_expressions() {
 		use Expr::*;
 
-		let file_name: std::rc::Rc<std::path::Path> = PathBuf::from("test.jsonnet").into();
+		let file_name = Source::new_virtual(Cow::Borrowed("<test>"));
 		let expr = parse(
 			"{} { local x = 1, x: x } + {}",
-			&ParserSettings {
-				file_name: file_name.clone(),
-			},
+			&ParserSettings { file_name },
 		)
 		.unwrap();
 		assert_eq!(
@@ -687,9 +737,8 @@ pub mod tests {
 						ObjExtend(
 							el!(Obj(ObjBody::MemberList(vec![])), 0, 2),
 							ObjBody::MemberList(vec![
-								Member::BindStmt(BindSpec {
-									name: "x".into(),
-									params: None,
+								Member::BindStmt(BindSpec::Field {
+									into: Destruct::Full("x".into()),
 									value: el!(Num(1.0), 15, 16)
 								}),
 								Member::Field(FieldMember {
@@ -712,11 +761,4 @@ pub mod tests {
 			),
 		);
 	}
-	// From source code
-	/*
-	#[bench]
-	fn bench_parse_peg(b: &mut Bencher) {
-		b.iter(|| parse!(jrsonnet_stdlib::STDLIB_STR))
-	}
-	*/
 }

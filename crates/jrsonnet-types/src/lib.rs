@@ -1,7 +1,8 @@
 #![allow(clippy::redundant_closure_call)]
 
-use gcmodule::Trace;
 use std::fmt::Display;
+
+use jrsonnet_gcmodule::Trace;
 
 #[macro_export]
 macro_rules! ty {
@@ -114,7 +115,7 @@ impl Display for ValType {
 }
 
 #[derive(Debug, Clone, PartialEq, Trace)]
-#[skip_trace]
+#[trace(skip)]
 pub enum ComplexValType {
 	Any,
 	Char,
@@ -122,7 +123,7 @@ pub enum ComplexValType {
 	BoundedNumber(Option<f64>, Option<f64>),
 	Array(Box<ComplexValType>),
 	ArrayRef(&'static ComplexValType),
-	ObjectRef(&'static [(&'static str, ComplexValType)]),
+	ObjectRef(&'static [(&'static str, &'static ComplexValType)]),
 	Union(Vec<ComplexValType>),
 	UnionRef(&'static [&'static ComplexValType]),
 	Sum(Vec<ComplexValType>),

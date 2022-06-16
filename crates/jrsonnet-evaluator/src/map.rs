@@ -1,27 +1,36 @@
-use gcmodule::{Cc, Trace};
+use jrsonnet_gcmodule::{Cc, Trace};
 use jrsonnet_interner::IStr;
 
-use crate::{GcHashMap, LazyVal};
+use crate::{GcHashMap, Thunk, Val};
 
 #[derive(Trace)]
-#[force_tracking]
+#[trace(tracking(force))]
 pub struct LayeredHashMapInternals {
 	parent: Option<LayeredHashMap>,
-	current: GcHashMap<IStr, LazyVal>,
+	current: GcHashMap<IStr, Thunk<Val>>,
 }
 
 #[derive(Trace)]
 pub struct LayeredHashMap(Cc<LayeredHashMapInternals>);
 
 impl LayeredHashMap {
-	pub fn extend(self, new_layer: GcHashMap<IStr, LazyVal>) -> Self {
+	pub fn iter_keys(self, mut handler: impl FnMut(IStr)) {
+		for (k, _) in self.0.current.iter() {
+			handler(k.clone());
+		}
+		if let Some(parent) = self.0.parent.clone() {
+			parent.iter_keys(handler);
+		}
+	}
+
+	pub fn extend(self, new_layer: GcHashMap<IStr, Thunk<Val>>) -> Self {
 		Self(Cc::new(LayeredHashMapInternals {
 			parent: Some(self),
 			current: new_layer,
 		}))
 	}
 
-	pub fn get(&self, key: &IStr) -> Option<&LazyVal> {
+	pub fn get(&self, key: &IStr) -> Option<&Thunk<Val>> {
 		(self.0)
 			.current
 			.get(key)
@@ -34,8 +43,7 @@ impl LayeredHashMap {
 				.0
 				.parent
 				.as_ref()
-				.map(|p| p.contains_key(key))
-				.unwrap_or(false)
+				.map_or(false, |p| p.contains_key(key))
 	}
 }
 

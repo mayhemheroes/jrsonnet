@@ -1,17 +1,33 @@
-use std::convert::{TryFrom, TryInto};
+use std::ops::Deref;
 
-use jrsonnet_interner::IStr;
+use jrsonnet_gcmodule::Cc;
+use jrsonnet_interner::{IBytes, IStr};
+pub use jrsonnet_macros::Typed;
 use jrsonnet_types::{ComplexValType, ValType};
 
 use crate::{
-	error::{Error::*, LocError, Result},
+	error::{Error::*, Result},
+	function::{FuncDesc, FuncVal},
 	throw,
 	typed::CheckType,
-	ArrValue, FuncVal, IndexableVal, ObjValue, Val,
+	val::{ArrValue, IndexableVal},
+	ObjValue, ObjValueBuilder, State, Val,
 };
 
-pub trait Typed: TryFrom<Val, Error = LocError> + TryInto<Val, Error = LocError> {
+pub trait TypedObj: Typed {
+	fn serialize(self, s: State, out: &mut ObjValueBuilder) -> Result<()>;
+	fn parse(obj: &ObjValue, s: State) -> Result<Self>;
+	fn into_object(self, s: State) -> Result<ObjValue> {
+		let mut builder = ObjValueBuilder::new();
+		self.serialize(s, &mut builder)?;
+		Ok(builder.build())
+	}
+}
+
+pub trait Typed: Sized {
 	const TYPE: &'static ComplexValType;
+	fn into_untyped(typed: Self, s: State) -> Result<Val>;
+	fn from_untyped(untyped: Val, s: State) -> Result<Self>;
 }
 
 macro_rules! impl_int {
@@ -19,14 +35,11 @@ macro_rules! impl_int {
 		impl Typed for $ty {
 			const TYPE: &'static ComplexValType =
 				&ComplexValType::BoundedNumber(Some(Self::MIN as f64), Some(Self::MAX as f64));
-		}
-		impl TryFrom<Val> for $ty {
-			type Error = LocError;
-
-			fn try_from(value: Val) -> Result<Self> {
-				<Self as Typed>::TYPE.check(&value)?;
+			fn from_untyped(value: Val, s: State) -> Result<Self> {
+				<Self as Typed>::TYPE.check(s, &value)?;
 				match value {
 					Val::Num(n) => {
+						#[allow(clippy::float_cmp)]
 						if n.trunc() != n {
 							throw!(RuntimeError(
 								format!(
@@ -41,12 +54,8 @@ macro_rules! impl_int {
 					_ => unreachable!(),
 				}
 			}
-		}
-		impl TryFrom<$ty> for Val {
-			type Error = LocError;
-
-			fn try_from(value: $ty) -> Result<Self> {
-				Ok(Self::Num(value as f64))
+			fn into_untyped(value: Self, _: State) -> Result<Val> {
+				Ok(Val::Num(value as f64))
 			}
 		}
 	)*};
@@ -54,63 +63,120 @@ macro_rules! impl_int {
 
 impl_int!(i8 u8 i16 u16 i32 u32);
 
+macro_rules! impl_bounded_int {
+	($($name:ident = $ty:ty)*) => {$(
+		#[derive(Clone, Copy)]
+		pub struct $name<const MIN: $ty, const MAX: $ty>($ty);
+		impl<const MIN: $ty, const MAX: $ty> $name<MIN, MAX> {
+			pub const fn new(value: $ty) -> Option<$name<MIN, MAX>> {
+				if value >= MIN && value <= MAX {
+					Some(Self(value))
+				} else {
+					None
+				}
+			}
+			pub const fn value(self) -> $ty {
+				self.0
+			}
+		}
+		impl<const MIN: $ty, const MAX: $ty> Deref for $name<MIN, MAX> {
+			type Target = $ty;
+			fn deref(&self) -> &Self::Target {
+				&self.0
+			}
+		}
+
+		impl<const MIN: $ty, const MAX: $ty> Typed for $name<MIN, MAX> {
+			const TYPE: &'static ComplexValType =
+				&ComplexValType::BoundedNumber(
+					Some(MIN as f64),
+					Some(MAX as f64),
+				);
+
+			fn from_untyped(value: Val, s: State) -> Result<Self> {
+				<Self as Typed>::TYPE.check(s, &value)?;
+				match value {
+					Val::Num(n) => {
+						#[allow(clippy::float_cmp)]
+						if n.trunc() != n {
+							throw!(RuntimeError(
+								format!(
+									"cannot convert number with fractional part to {}",
+									stringify!($ty)
+								)
+								.into()
+							))
+						}
+						Ok(Self(n as $ty))
+					}
+					_ => unreachable!(),
+				}
+			}
+
+			fn into_untyped(value: Self, _: State) -> Result<Val> {
+				Ok(Val::Num(value.0 as f64))
+			}
+		}
+	)*};
+}
+
+impl_bounded_int!(
+	BoundedI8 = i8
+	BoundedI16 = i16
+	BoundedI32 = i32
+	BoundedI64 = i64
+	BoundedUsize = usize
+);
+
 impl Typed for f64 {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Num);
-}
-impl TryFrom<Val> for f64 {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Num(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Num(n) => Ok(n),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<f64> for Val {
-	type Error = LocError;
-
-	fn try_from(value: f64) -> Result<Self> {
-		Ok(Self::Num(value))
-	}
-}
 
 pub struct PositiveF64(pub f64);
 impl Typed for PositiveF64 {
 	const TYPE: &'static ComplexValType = &ComplexValType::BoundedNumber(Some(0.0), None);
-}
-impl TryFrom<Val> for PositiveF64 {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Num(value.0))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Num(n) => Ok(Self(n)),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<PositiveF64> for Val {
-	type Error = LocError;
-
-	fn try_from(value: PositiveF64) -> Result<Self> {
-		Ok(Self::Num(value.0))
-	}
-}
-
 impl Typed for usize {
 	// It is possible to store 54 bits of precision in f64, but leaving u32::MAX here for compatibility
 	const TYPE: &'static ComplexValType =
-		&ComplexValType::BoundedNumber(Some(0.0), Some(4294967295.0));
-}
-impl TryFrom<Val> for usize {
-	type Error = LocError;
+		&ComplexValType::BoundedNumber(Some(0.0), Some(u32::MAX as f64));
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		if value > u32::MAX as Self {
+			throw!(RuntimeError("number is too large".into()))
+		}
+		Ok(Val::Num(value as f64))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Num(n) => {
+				#[allow(clippy::float_cmp)]
 				if n.trunc() != n {
 					throw!(RuntimeError(
 						"cannot convert number with fractional part to usize".into()
@@ -122,106 +188,76 @@ impl TryFrom<Val> for usize {
 		}
 	}
 }
-impl TryFrom<usize> for Val {
-	type Error = LocError;
-
-	fn try_from(value: usize) -> Result<Self> {
-		if value > u32::MAX as usize {
-			throw!(RuntimeError("number is too large".into()))
-		}
-		Ok(Self::Num(value as f64))
-	}
-}
 
 impl Typed for IStr {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Str);
-}
-impl TryFrom<Val> for IStr {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Str(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Str(s) => Ok(s),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<IStr> for Val {
-	type Error = LocError;
-
-	fn try_from(value: IStr) -> Result<Self> {
-		Ok(Self::Str(value))
-	}
-}
 
 impl Typed for String {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Str);
-}
-impl TryFrom<Val> for String {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Str(value.into()))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Str(s) => Ok(s.to_string()),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<String> for Val {
-	type Error = LocError;
-
-	fn try_from(value: String) -> Result<Self> {
-		Ok(Self::Str(value.into()))
-	}
-}
 
 impl Typed for char {
 	const TYPE: &'static ComplexValType = &ComplexValType::Char;
-}
-impl TryFrom<Val> for char {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Str(value.to_string().into()))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Str(s) => Ok(s.chars().next().unwrap()),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<char> for Val {
-	type Error = LocError;
-
-	fn try_from(value: char) -> Result<Self> {
-		Ok(Self::Str(value.to_string().into()))
-	}
-}
 
 impl<T> Typed for Vec<T>
 where
 	T: Typed,
-	T: TryFrom<Val, Error = LocError>,
-	T: TryInto<Val, Error = LocError>,
 {
 	const TYPE: &'static ComplexValType = &ComplexValType::ArrayRef(T::TYPE);
-}
-impl<T> TryFrom<Val> for Vec<T>
-where
-	T: Typed,
-	T: TryFrom<Val, Error = LocError>,
-	T: TryInto<Val, Error = LocError>,
-{
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, s: State) -> Result<Val> {
+		let mut o = Vec::with_capacity(value.len());
+		for i in value {
+			o.push(T::into_untyped(i, s.clone())?);
+		}
+		Ok(Val::Arr(o.into()))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s.clone(), &value)?;
 		match value {
 			Val::Arr(a) => {
 				let mut o = Self::with_capacity(a.len());
-				for i in a.iter() {
-					o.push(T::try_from(i?)?);
+				for i in a.iter(s.clone()) {
+					o.push(T::from_untyped(i?, s.clone())?);
 				}
 				Ok(o)
 			}
@@ -229,88 +265,82 @@ where
 		}
 	}
 }
-impl<T> TryFrom<Vec<T>> for Val
-where
-	T: Typed,
-	T: TryFrom<Self, Error = LocError>,
-	T: TryInto<Self, Error = LocError>,
-{
-	type Error = LocError;
-
-	fn try_from(value: Vec<T>) -> Result<Self> {
-		let mut o = Vec::with_capacity(value.len());
-		for i in value {
-			o.push(i.try_into()?);
-		}
-		Ok(Self::Arr(o.into()))
-	}
-}
 
 /// To be used in Vec<Any>
-/// Regular Val can't be used here, because it has wrong TryFrom::Error type
+/// Regular Val can't be used here, because it has wrong `TryFrom::Error` type
 #[derive(Clone)]
 pub struct Any(pub Val);
 
 impl Typed for Any {
 	const TYPE: &'static ComplexValType = &ComplexValType::Any;
-}
-impl TryFrom<Val> for Any {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(value.0)
+	}
+
+	fn from_untyped(value: Val, _: State) -> Result<Self> {
 		Ok(Self(value))
 	}
 }
-impl TryFrom<Any> for Val {
-	type Error = LocError;
 
-	fn try_from(value: Any) -> Result<Self> {
-		Ok(value.0)
-	}
-}
-
-/// Specialization, provides faster TryFrom<VecVal> for Val
-pub struct VecVal(pub Vec<Val>);
+/// Specialization, provides faster `TryFrom<VecVal>` for Val
+pub struct VecVal(pub Cc<Vec<Val>>);
 
 impl Typed for VecVal {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Arr);
-}
-impl TryFrom<Val> for VecVal {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Arr(ArrValue::Eager(value.0)))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s.clone(), &value)?;
 		match value {
-			Val::Arr(a) => Ok(Self(a.evaluated()?.to_vec())),
+			Val::Arr(a) => Ok(Self(a.evaluated(s)?)),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<VecVal> for Val {
-	type Error = LocError;
 
-	fn try_from(value: VecVal) -> Result<Self> {
-		Ok(Self::Arr(value.0.into()))
+/// Specialization
+impl Typed for IBytes {
+	const TYPE: &'static ComplexValType =
+		&ComplexValType::ArrayRef(&ComplexValType::BoundedNumber(Some(0.0), Some(255.0)));
+
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Arr(ArrValue::Bytes(value)))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		if let Val::Arr(ArrValue::Bytes(bytes)) = value {
+			return Ok(bytes);
+		}
+		<Self as Typed>::TYPE.check(s.clone(), &value)?;
+		match value {
+			Val::Arr(a) => {
+				let mut out = Vec::with_capacity(a.len());
+				for e in a.iter(s.clone()) {
+					let r = e?;
+					out.push(u8::from_untyped(r, s.clone())?);
+				}
+				Ok(out.as_slice().into())
+			}
+			_ => unreachable!(),
+		}
 	}
 }
 
 pub struct M1;
 impl Typed for M1 {
 	const TYPE: &'static ComplexValType = &ComplexValType::BoundedNumber(Some(-1.0), Some(-1.0));
-}
-impl TryFrom<Val> for M1 {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
-		Ok(Self)
+	fn into_untyped(_: Self, _: State) -> Result<Val> {
+		Ok(Val::Num(-1.0))
 	}
-}
-impl TryFrom<M1> for Val {
-	type Error = LocError;
 
-	fn try_from(_: M1) -> Result<Self> {
-		Ok(Self::Num(-1.0))
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
+		Ok(Self)
 	}
 }
 
@@ -324,33 +354,22 @@ macro_rules! decl_either {
 			$($id: Typed,)*
 		{
 			const TYPE: &'static ComplexValType = &ComplexValType::UnionRef(&[$($id::TYPE),*]);
-		}
-		impl<$($id),*> TryFrom<Val> for $name<$($id),*>
-		where
-			$($id: Typed,)*
-		{
-			type Error = LocError;
 
-			fn try_from(value: Val) -> Result<Self> {
+			fn into_untyped(value: Self, s: State) -> Result<Val> {
+				match value {$(
+					$name::$id(v) => $id::into_untyped(v, s)
+				),*}
+			}
+
+			fn from_untyped(value: Val, s: State) -> Result<Self> {
 				$(
-					if $id::TYPE.check(&value).is_ok() {
-						$id::try_from(value).map(Self::$id)
+					if $id::TYPE.check(s.clone(), &value).is_ok() {
+						$id::from_untyped(value, s.clone()).map(Self::$id)
 					} else
 				)* {
-					<Self as Typed>::TYPE.check(&value)?;
+					<Self as Typed>::TYPE.check(s, &value)?;
 					unreachable!()
 				}
-			}
-		}
-		impl<$($id),*> TryFrom<$name<$($id),*>> for Val
-		where
-			$($id: Typed,)*
-		{
-			type Error = LocError;
-			fn try_from(value: $name<$($id),*>) -> Result<Self> {
-				match value {$(
-					$name::$id(v) => v.try_into()
-				),*}
 			}
 		}
 	)*}
@@ -379,132 +398,113 @@ pub type MyType = Either![u32, f64, String];
 
 impl Typed for ArrValue {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Arr);
-}
-impl TryFrom<Val> for ArrValue {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Arr(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Arr(a) => Ok(a),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<ArrValue> for Val {
-	type Error = LocError;
-
-	fn try_from(value: ArrValue) -> Result<Self> {
-		Ok(Self::Arr(value))
-	}
-}
 
 impl Typed for FuncVal {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Func);
-}
-impl TryFrom<Val> for FuncVal {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Func(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Func(a) => Ok(a),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<FuncVal> for Val {
-	type Error = LocError;
 
-	fn try_from(value: FuncVal) -> Result<Self> {
-		Ok(Self::Func(value))
+impl Typed for Cc<FuncDesc> {
+	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Func);
+
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Func(FuncVal::Normal(value)))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
+		match value {
+			Val::Func(FuncVal::Normal(desc)) => Ok(desc),
+			Val::Func(_) => throw!(RuntimeError("expected normal function, not builtin".into())),
+			_ => unreachable!(),
+		}
 	}
 }
+
 impl Typed for ObjValue {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Obj);
-}
-impl TryFrom<Val> for ObjValue {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Obj(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Obj(a) => Ok(a),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<ObjValue> for Val {
-	type Error = LocError;
-
-	fn try_from(value: ObjValue) -> Result<Self> {
-		Ok(Self::Obj(value))
-	}
-}
 
 impl Typed for bool {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Bool);
-}
-impl TryFrom<Val> for bool {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
+		Ok(Val::Bool(value))
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
 		match value {
 			Val::Bool(a) => Ok(a),
 			_ => unreachable!(),
 		}
 	}
 }
-impl TryFrom<bool> for Val {
-	type Error = LocError;
-
-	fn try_from(value: bool) -> Result<Self> {
-		Ok(Self::Bool(value))
-	}
-}
-
 impl Typed for IndexableVal {
 	const TYPE: &'static ComplexValType = &ComplexValType::UnionRef(&[
 		&ComplexValType::Simple(ValType::Arr),
 		&ComplexValType::Simple(ValType::Str),
 	]);
-}
-impl TryFrom<Val> for IndexableVal {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
-		value.into_indexable()
-	}
-}
-impl TryFrom<IndexableVal> for Val {
-	type Error = LocError;
-
-	fn try_from(value: IndexableVal) -> Result<Self> {
+	fn into_untyped(value: Self, _: State) -> Result<Val> {
 		match value {
-			IndexableVal::Str(s) => Ok(Self::Str(s)),
-			IndexableVal::Arr(a) => Ok(Self::Arr(a)),
+			IndexableVal::Str(s) => Ok(Val::Str(s)),
+			IndexableVal::Arr(a) => Ok(Val::Arr(a)),
 		}
+	}
+
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
+		value.into_indexable()
 	}
 }
 
 pub struct Null;
 impl Typed for Null {
 	const TYPE: &'static ComplexValType = &ComplexValType::Simple(ValType::Null);
-}
-impl TryFrom<Val> for Null {
-	type Error = LocError;
 
-	fn try_from(value: Val) -> Result<Self> {
-		<Self as Typed>::TYPE.check(&value)?;
-		Ok(Self)
+	fn into_untyped(_: Self, _: State) -> Result<Val> {
+		Ok(Val::Null)
 	}
-}
-impl TryFrom<Null> for Val {
-	type Error = LocError;
 
-	fn try_from(_: Null) -> Result<Self> {
-		Ok(Self::Null)
+	fn from_untyped(value: Val, s: State) -> Result<Self> {
+		<Self as Typed>::TYPE.check(s, &value)?;
+		Ok(Self)
 	}
 }

@@ -3,17 +3,18 @@ mod manifest;
 mod tla;
 mod trace;
 
+use std::{env, path::PathBuf};
+
+use clap::Parser;
 pub use ext::*;
+use jrsonnet_evaluator::{error::Result, FileImportResolver, State};
+use jrsonnet_gcmodule::with_thread_object_space;
 pub use manifest::*;
 pub use tla::*;
 pub use trace::*;
 
-use clap::Parser;
-use jrsonnet_evaluator::{error::Result, EvaluationState, FileImportResolver};
-use std::{env, path::PathBuf};
-
 pub trait ConfigureState {
-	fn configure(&self, state: &EvaluationState) -> Result<()>;
+	fn configure(&self, s: &State) -> Result<()>;
 }
 
 #[derive(Parser)]
@@ -50,9 +51,9 @@ pub struct MiscOpts {
 	jpath: Vec<PathBuf>,
 }
 impl ConfigureState for MiscOpts {
-	fn configure(&self, state: &EvaluationState) -> Result<()> {
+	fn configure(&self, s: &State) -> Result<()> {
 		if !self.no_stdlib {
-			state.with_stdlib();
+			s.with_stdlib();
 		}
 
 		let mut library_paths = self.jpath.clone();
@@ -61,9 +62,9 @@ impl ConfigureState for MiscOpts {
 			library_paths.extend(env::split_paths(path.as_os_str()));
 		}
 
-		state.set_import_resolver(Box::new(FileImportResolver { library_paths }));
+		s.set_import_resolver(Box::new(FileImportResolver { library_paths }));
 
-		state.set_max_stack(self.max_stack);
+		s.set_max_stack(self.max_stack);
 		Ok(())
 	}
 }
@@ -85,12 +86,12 @@ pub struct GeneralOpts {
 }
 
 impl ConfigureState for GeneralOpts {
-	fn configure(&self, state: &EvaluationState) -> Result<()> {
+	fn configure(&self, s: &State) -> Result<()> {
 		// Configure trace first, because tla-code/ext-code can throw
-		self.trace.configure(state)?;
-		self.misc.configure(state)?;
-		self.tla.configure(state)?;
-		self.ext.configure(state)?;
+		self.trace.configure(s)?;
+		self.misc.configure(s)?;
+		self.tla.configure(s)?;
+		self.ext.configure(s)?;
 		Ok(())
 	}
 }
@@ -111,15 +112,21 @@ pub struct GcOpts {
 	gc_collect_before_printing_stats: bool,
 }
 impl GcOpts {
-	pub fn configure_global(&self) {
-		if !self.gc_collect_on_exit {
-			gcmodule::set_thread_collect_on_drop(false)
-		}
+	pub fn stats_printer(&self) -> (Option<GcStatsPrinter>, Option<LeakSpace>) {
+		(
+			self.gc_print_stats.then(|| GcStatsPrinter {
+				collect_before_printing_stats: self.gc_collect_before_printing_stats,
+			}),
+			(!self.gc_collect_on_exit).then(|| LeakSpace {}),
+		)
 	}
-	pub fn stats_printer(&self) -> Option<GcStatsPrinter> {
-		self.gc_print_stats.then(|| GcStatsPrinter {
-			collect_before_printing_stats: self.gc_collect_before_printing_stats,
-		})
+}
+
+pub struct LeakSpace {}
+
+impl Drop for LeakSpace {
+	fn drop(&mut self) {
+		with_thread_object_space(|s| s.leak())
 	}
 }
 
@@ -130,9 +137,9 @@ impl Drop for GcStatsPrinter {
 	fn drop(&mut self) {
 		eprintln!("=== GC STATS ===");
 		if self.collect_before_printing_stats {
-			let collected = gcmodule::collect_thread_cycles();
+			let collected = jrsonnet_gcmodule::collect_thread_cycles();
 			eprintln!("Collected: {}", collected);
 		}
-		eprintln!("Tracked: {}", gcmodule::count_thread_tracked())
+		eprintln!("Tracked: {}", jrsonnet_gcmodule::count_thread_tracked())
 	}
 }

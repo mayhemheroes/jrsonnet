@@ -1,70 +1,98 @@
-#![warn(clippy::all, clippy::nursery)]
+#![warn(clippy::all, clippy::nursery, clippy::pedantic)]
 #![allow(
 	macro_expanded_macro_exports_accessed_by_absolute_paths,
-	clippy::ptr_arg
+	clippy::ptr_arg,
+	// Too verbose
+	clippy::must_use_candidate,
+	// A lot of functions pass around errors thrown by code
+	clippy::missing_errors_doc,
+	// A lot of pointers have interior Rc
+	clippy::needless_pass_by_value,
+	// Its fine
+	clippy::wildcard_imports,
+	clippy::enum_glob_use,
+	clippy::module_name_repetitions,
+	// TODO: fix individual issues, however this works as intended almost everywhere
+	clippy::cast_precision_loss,
+	clippy::cast_possible_wrap,
+	clippy::cast_possible_truncation,
+	clippy::cast_sign_loss,
+	// False positives
+	// https://github.com/rust-lang/rust-clippy/issues/6902
+	clippy::use_self,
+	// https://github.com/rust-lang/rust-clippy/issues/8539
+	clippy::iter_with_drain,
 )]
 
 // For jrsonnet-macros
 extern crate self as jrsonnet_evaluator;
 
-mod builtin;
 mod ctx;
 mod dynamic;
 pub mod error;
 mod evaluate;
 pub mod function;
+pub mod gc;
 mod import;
 mod integrations;
 mod map;
-pub mod native;
 mod obj;
+mod stdlib;
 pub mod trace;
 pub mod typed;
-mod val;
+pub mod val;
 
-pub use jrsonnet_parser as parser;
+use std::{
+	borrow::Cow,
+	cell::{Ref, RefCell, RefMut},
+	collections::HashMap,
+	fmt::{self, Debug},
+	path::{Path, PathBuf},
+	rc::Rc,
+};
 
 pub use ctx::*;
 pub use dynamic::*;
 use error::{Error::*, LocError, Result, StackTraceElement};
 pub use evaluate::*;
-use function::{Builtin, TlaArg};
+use function::{builtin::Builtin, CallLocation, TlaArg};
 use gc::{GcHashMap, TraceBox};
-use gcmodule::{Cc, Trace, Weak};
+use hashbrown::hash_map::RawEntryMut;
 pub use import::*;
+use jrsonnet_gcmodule::{Cc, Trace};
+use jrsonnet_interner::IBytes;
 pub use jrsonnet_interner::IStr;
+pub use jrsonnet_parser as parser;
 use jrsonnet_parser::*;
 pub use obj::*;
-use std::{
-	cell::{Ref, RefCell, RefMut},
-	collections::HashMap,
-	fmt::Debug,
-	path::{Path, PathBuf},
-	rc::Rc,
-};
 use trace::{location_to_offset, offset_to_location, CodeLocation, CompactFormat, TraceFormat};
-pub use val::*;
-pub mod gc;
+pub use val::{ManifestFormat, Thunk, Val};
 
-pub trait Bindable: Trace + 'static {
-	fn bind(&self, this: Option<ObjValue>, super_obj: Option<ObjValue>) -> Result<LazyVal>;
+pub trait Unbound: Trace {
+	type Bound;
+	fn bind(&self, s: State, sup: Option<ObjValue>, this: Option<ObjValue>) -> Result<Self::Bound>;
 }
 
 #[derive(Clone, Trace)]
 pub enum LazyBinding {
-	Bindable(Cc<TraceBox<dyn Bindable>>),
-	Bound(LazyVal),
+	Bindable(Cc<TraceBox<dyn Unbound<Bound = Thunk<Val>>>>),
+	Bound(Thunk<Val>),
 }
 
 impl Debug for LazyBinding {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "LazyBinding")
 	}
 }
 impl LazyBinding {
-	pub fn evaluate(&self, this: Option<ObjValue>, super_obj: Option<ObjValue>) -> Result<LazyVal> {
+	pub fn evaluate(
+		&self,
+		s: State,
+		sup: Option<ObjValue>,
+		this: Option<ObjValue>,
+	) -> Result<Thunk<Val>> {
 		match self {
-			Self::Bindable(v) => v.bind(this, super_obj),
+			Self::Bindable(v) => v.bind(s, sup, this),
 			Self::Bound(v) => Ok(v.clone()),
 		}
 	}
@@ -76,7 +104,7 @@ pub struct EvaluationSettings {
 	/// Limits amount of stack trace items preserved
 	pub max_trace: usize,
 	/// Used for s`td.extVar`
-	pub ext_vars: HashMap<IStr, Val>,
+	pub ext_vars: HashMap<IStr, TlaArg>,
 	/// Used for ext.native
 	pub ext_natives: HashMap<IStr, Cc<TraceBox<dyn Builtin>>>,
 	/// TLA vars
@@ -95,12 +123,16 @@ impl Default for EvaluationSettings {
 		Self {
 			max_stack: 200,
 			max_trace: 20,
-			globals: Default::default(),
-			ext_vars: Default::default(),
-			ext_natives: Default::default(),
-			tla_vars: Default::default(),
+			globals: HashMap::default(),
+			ext_vars: HashMap::default(),
+			ext_natives: HashMap::default(),
+			tla_vars: HashMap::default(),
 			import_resolver: Box::new(DummyImportResolver),
-			manifest_format: ManifestFormat::Json(4),
+			manifest_format: ManifestFormat::Json {
+				padding: 4,
+				#[cfg(feature = "exp-preserve-order")]
+				preserve_order: false,
+			},
 			trace_format: Box::new(CompactFormat {
 				padding: 4,
 				resolver: trace::PathResolver::Absolute,
@@ -117,15 +149,39 @@ struct EvaluationData {
 	stack_generation: usize,
 
 	breakpoints: Breakpoints,
-	/// Contains file source codes and evaluation results for imports and pretty-printed stacktraces
-	files: HashMap<Rc<Path>, FileData>,
-	str_files: HashMap<Rc<Path>, IStr>,
-}
 
-pub struct FileData {
-	source_code: IStr,
-	parsed: LocExpr,
+	/// Contains file source codes and evaluation results for imports and pretty-printed stacktraces
+	files: GcHashMap<PathBuf, FileData>,
+	/// Contains tla arguments and others, which aren't needed to be obtained by name
+	volatile_files: GcHashMap<String, String>,
+}
+struct FileData {
+	string: Option<IStr>,
+	bytes: Option<IBytes>,
+	parsed: Option<LocExpr>,
 	evaluated: Option<Val>,
+
+	evaluating: bool,
+}
+impl FileData {
+	fn new_string(data: IStr) -> Self {
+		Self {
+			string: Some(data),
+			bytes: None,
+			parsed: None,
+			evaluated: None,
+			evaluating: false,
+		}
+	}
+	fn new_bytes(data: IBytes) -> Self {
+		Self {
+			string: None,
+			bytes: Some(data),
+			parsed: None,
+			evaluated: None,
+			evaluating: false,
+		}
+	}
 }
 
 #[allow(clippy::type_complexity)]
@@ -146,7 +202,7 @@ impl Breakpoints {
 		if self.0.is_empty() {
 			return result;
 		}
-		for item in self.0.iter() {
+		for item in &self.0 {
 			if item.loc.belongs_to(loc) {
 				let mut collected = item.collected.borrow_mut();
 				let (depth, vals) = collected.entry(stack_generation).or_default();
@@ -168,163 +224,182 @@ pub struct EvaluationStateInternals {
 	settings: RefCell<EvaluationSettings>,
 }
 
-thread_local! {
-	/// Contains the state for a currently executed file.
-	/// Global state is fine here.
-	pub(crate) static EVAL_STATE: RefCell<Option<EvaluationState>> = RefCell::new(None)
-}
-pub(crate) fn with_state<T>(f: impl FnOnce(&EvaluationState) -> T) -> T {
-	EVAL_STATE.with(|s| f(s.borrow().as_ref().unwrap()))
-}
-pub fn push_frame<T>(
-	e: Option<&ExprLocation>,
-	frame_desc: impl FnOnce() -> String,
-	f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-	with_state(|s| s.push(e, frame_desc, f))
-}
-
-#[allow(dead_code)]
-pub fn push_val_frame(
-	e: &ExprLocation,
-	frame_desc: impl FnOnce() -> String,
-	f: impl FnOnce() -> Result<Val>,
-) -> Result<Val> {
-	with_state(|s| s.push_val(e, frame_desc, f))
-}
-#[allow(dead_code)]
-pub fn push_description_frame<T>(
-	frame_desc: impl FnOnce() -> String,
-	f: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-	with_state(|s| s.push_description(frame_desc, f))
-}
-
 /// Maintains stack trace and import resolution
 #[derive(Default, Clone)]
-pub struct EvaluationState(Rc<EvaluationStateInternals>);
+pub struct State(Rc<EvaluationStateInternals>);
 
-impl EvaluationState {
-	/// Parses and adds file as loaded
-	pub fn add_file(&self, path: Rc<Path>, source_code: IStr) -> Result<LocExpr> {
-		let parsed = parse(
-			&source_code,
-			&ParserSettings {
-				file_name: path.clone(),
-			},
-		)
-		.map_err(|error| ImportSyntaxError {
-			error: Box::new(error),
-			path: path.to_owned(),
-			source_code: source_code.clone(),
-		})?;
-		self.add_parsed_file(path, source_code, parsed.clone())?;
+impl State {
+	pub fn import_str(&self, path: PathBuf) -> Result<IStr> {
+		let mut data = self.data_mut();
+		let mut file = data.files.raw_entry_mut().from_key(&path);
 
-		Ok(parsed)
+		let file = match file {
+			RawEntryMut::Occupied(ref mut d) => d.get_mut(),
+			RawEntryMut::Vacant(v) => {
+				let data = self.settings().import_resolver.load_file_contents(&path)?;
+				v.insert(
+					path.clone(),
+					FileData::new_string(
+						std::str::from_utf8(&data)
+							.map_err(|_| ImportBadFileUtf8(path.clone()))?
+							.into(),
+					),
+				)
+				.1
+			}
+		};
+		if let Some(str) = &file.string {
+			return Ok(str.clone());
+		}
+		if file.string.is_none() {
+			file.string = Some(
+				file.bytes
+					.as_ref()
+					.expect("either string or bytes should be set")
+					.clone()
+					.cast_str()
+					.ok_or_else(|| ImportBadFileUtf8(path.clone()))?,
+			);
+		}
+		Ok(file.string.as_ref().expect("just set").clone())
+	}
+	pub fn import_bin(&self, path: PathBuf) -> Result<IBytes> {
+		let mut data = self.data_mut();
+		let mut file = data.files.raw_entry_mut().from_key(&path);
+
+		let file = match file {
+			RawEntryMut::Occupied(ref mut d) => d.get_mut(),
+			RawEntryMut::Vacant(v) => {
+				let data = self.settings().import_resolver.load_file_contents(&path)?;
+				v.insert(path.clone(), FileData::new_bytes(data.as_slice().into()))
+					.1
+			}
+		};
+		if let Some(str) = &file.bytes {
+			return Ok(str.clone());
+		}
+		if file.bytes.is_none() {
+			file.bytes = Some(
+				file.string
+					.as_ref()
+					.expect("either string or bytes should be set")
+					.clone()
+					.cast_bytes(),
+			);
+		}
+		Ok(file.bytes.as_ref().expect("just set").clone())
+	}
+	pub fn import(&self, path: PathBuf) -> Result<Val> {
+		let mut data = self.data_mut();
+		let mut file = data.files.raw_entry_mut().from_key(&path);
+
+		let file = match file {
+			RawEntryMut::Occupied(ref mut d) => d.get_mut(),
+			RawEntryMut::Vacant(v) => {
+				let data = self.settings().import_resolver.load_file_contents(&path)?;
+				v.insert(
+					path.clone(),
+					FileData::new_string(
+						std::str::from_utf8(&data)
+							.map_err(|_| ImportBadFileUtf8(path.clone()))?
+							.into(),
+					),
+				)
+				.1
+			}
+		};
+		if let Some(val) = &file.evaluated {
+			return Ok(val.clone());
+		}
+		if file.string.is_none() {
+			file.string = Some(
+				std::str::from_utf8(
+					file.bytes
+						.as_ref()
+						.expect("either string or bytes should be set"),
+				)
+				.map_err(|_| ImportBadFileUtf8(path.clone()))?
+				.into(),
+			);
+		}
+		let code = file.string.as_ref().expect("just set");
+		let file_name = Source::new(path.clone()).expect("resolver should return correct name");
+		if file.parsed.is_none() {
+			file.parsed = Some(
+				jrsonnet_parser::parse(
+					code,
+					&ParserSettings {
+						file_name: file_name.clone(),
+					},
+				)
+				.map_err(|e| ImportSyntaxError {
+					path: file_name,
+					source_code: code.clone(),
+					error: Box::new(e),
+				})?,
+			);
+		}
+		let parsed = file.parsed.as_ref().expect("just set").clone();
+		if file.evaluating {
+			throw!(InfiniteRecursionDetected)
+		}
+		file.evaluating = true;
+		// Dropping file here, as it borrows data, which may be used in evaluation
+		drop(data);
+		let res = evaluate(self.clone(), self.create_default_context(), &parsed);
+
+		let mut data = self.data_mut();
+		let mut file = data.files.raw_entry_mut().from_key(&path);
+
+		let file = match file {
+			RawEntryMut::Occupied(ref mut d) => d.get_mut(),
+			RawEntryMut::Vacant(_) => unreachable!("this file was just here!"),
+		};
+		file.evaluating = false;
+		match res {
+			Ok(v) => {
+				file.evaluated = Some(v.clone());
+				Ok(v)
+			}
+			Err(e) => Err(e),
+		}
 	}
 
-	pub fn reset_evaluation_state(&self, name: &Path) {
-		self.data_mut()
-			.files
-			.get_mut(name)
-			.unwrap()
-			.evaluated
-			.take();
+	pub fn get_source(&self, name: Source) -> Option<String> {
+		let data = self.data();
+		match name.repr() {
+			Ok(real) => data
+				.files
+				.get(real)
+				.and_then(|f| f.string.as_ref())
+				.map(ToString::to_string),
+			Err(e) => data.volatile_files.get(e).map(ToOwned::to_owned),
+		}
 	}
-
-	/// Adds file by source code and parsed expr
-	pub fn add_parsed_file(
-		&self,
-		name: Rc<Path>,
-		source_code: IStr,
-		parsed: LocExpr,
-	) -> Result<()> {
-		self.data_mut().files.insert(
-			name,
-			FileData {
-				source_code,
-				parsed,
-				evaluated: None,
-			},
-		);
-
-		Ok(())
-	}
-	pub fn get_source(&self, name: &Path) -> Option<IStr> {
-		let ro_map = &self.data().files;
-		ro_map.get(name).map(|value| value.source_code.clone())
-	}
-	pub fn map_source_locations(&self, file: &Path, locs: &[usize]) -> Vec<CodeLocation> {
+	pub fn map_source_locations(&self, file: Source, locs: &[u32]) -> Vec<CodeLocation> {
 		offset_to_location(&self.get_source(file).unwrap_or_else(|| "".into()), locs)
 	}
 	pub fn map_from_source_location(
 		&self,
-		file: &Path,
+		file: Source,
 		line: usize,
 		column: usize,
 	) -> Option<usize> {
-		location_to_offset(&self.get_source(file).unwrap(), line, column)
+		location_to_offset(
+			&self.get_source(file).expect("file not found"),
+			line,
+			column,
+		)
 	}
-	pub fn import_file(&self, from: &Path, path: &Path) -> Result<Val> {
-		let file_path = self.resolve_file(from, path)?;
-		{
-			let data = self.data();
-			let files = &data.files;
-			if files.contains_key(&file_path as &Path) {
-				drop(data);
-				return self.evaluate_loaded_file_raw(&file_path);
-			}
-		}
-		let contents = self.load_file_contents(&file_path)?;
-		self.add_file(file_path.clone(), contents)?;
-		self.evaluate_loaded_file_raw(&file_path)
-	}
-	pub(crate) fn import_file_str(&self, from: &Path, path: &Path) -> Result<IStr> {
-		let path = self.resolve_file(from, path)?;
-		if !self.data().str_files.contains_key(&path) {
-			let file_str = self.load_file_contents(&path)?;
-			self.data_mut().str_files.insert(path.clone(), file_str);
-		}
-		Ok(self.data().str_files.get(&path).cloned().unwrap())
-	}
-
-	fn evaluate_loaded_file_raw(&self, name: &Path) -> Result<Val> {
-		let expr: LocExpr = {
-			let ro_map = &self.data().files;
-			let value = ro_map
-				.get(name)
-				.unwrap_or_else(|| panic!("file not added: {:?}", name));
-			if let Some(ref evaluated) = value.evaluated {
-				return Ok(evaluated.clone());
-			}
-			value.parsed.clone()
-		};
-		let value = evaluate(self.create_default_context(), &expr)?;
-		{
-			self.data_mut()
-				.files
-				.get_mut(name)
-				.unwrap()
-				.evaluated
-				.replace(value.clone());
-		}
-		Ok(value)
-	}
-
 	/// Adds standard library global variable (std) to this evaluator
 	pub fn with_stdlib(&self) -> &Self {
-		use jrsonnet_stdlib::STDLIB_STR;
-		let std_path: Rc<Path> = PathBuf::from("std.jsonnet").into();
-		self.run_in_state(|| {
-			self.add_parsed_file(
-				std_path.clone(),
-				STDLIB_STR.to_owned().into(),
-				builtin::get_parsed_stdlib(),
-			)
-			.unwrap();
-			let val = self.evaluate_loaded_file_raw(&std_path).unwrap();
-			self.settings_mut().globals.insert("std".into(), val);
-		});
+		let val = evaluate(
+			self.clone(),
+			self.create_default_context(),
+			&stdlib::get_parsed_stdlib(),
+		)
+		.expect("std should not fail");
+		self.settings_mut().globals.insert("std".into(), val);
 		self
 	}
 
@@ -333,15 +408,15 @@ impl EvaluationState {
 		let globals = &self.settings().globals;
 		let mut new_bindings = GcHashMap::with_capacity(globals.len());
 		for (name, value) in globals.iter() {
-			new_bindings.insert(name.clone(), LazyVal::new_resolved(value.clone()));
+			new_bindings.insert(name.clone(), Thunk::evaluated(value.clone()));
 		}
-		Context::new().extend_bound(new_bindings)
+		Context::new().extend(new_bindings, None, None, None)
 	}
 
 	/// Executes code creating a new stack frame
 	pub fn push<T>(
 		&self,
-		e: Option<&ExprLocation>,
+		e: CallLocation,
 		frame_desc: impl FnOnce() -> String,
 		f: impl FnOnce() -> Result<T>,
 	) -> Result<T> {
@@ -352,9 +427,8 @@ impl EvaluationState {
 				// Error creation uses data, so i drop guard here
 				drop(data);
 				throw!(StackOverflow);
-			} else {
-				*stack_depth += 1;
 			}
+			*stack_depth += 1;
 		}
 		let result = f();
 		{
@@ -364,7 +438,7 @@ impl EvaluationState {
 		}
 		if let Err(mut err) = result {
 			err.trace_mut().0.push(StackTraceElement {
-				location: e.cloned(),
+				location: e.0.cloned(),
 				desc: frame_desc(),
 			});
 			return Err(err);
@@ -386,9 +460,8 @@ impl EvaluationState {
 				// Error creation uses data, so i drop guard here
 				drop(data);
 				throw!(StackOverflow);
-			} else {
-				*stack_depth += 1;
 			}
+			*stack_depth += 1;
 		}
 		let mut result = f();
 		{
@@ -421,9 +494,8 @@ impl EvaluationState {
 				// Error creation uses data, so i drop guard here
 				drop(data);
 				throw!(StackOverflow);
-			} else {
-				*stack_depth += 1;
 			}
+			*stack_depth += 1;
 		}
 		let result = f();
 		{
@@ -441,40 +513,8 @@ impl EvaluationState {
 		result
 	}
 
-	/// Runs passed function in state (required if function needs to modify stack trace)
-	pub fn run_in_state<T>(&self, f: impl FnOnce() -> T) -> T {
-		EVAL_STATE.with(|v| {
-			let has_state = v.borrow().is_some();
-			if !has_state {
-				v.borrow_mut().replace(self.clone());
-			}
-			let result = f();
-			if !has_state {
-				v.borrow_mut().take();
-			}
-			result
-		})
-	}
-	pub fn run_in_state_with_breakpoint(
-		&self,
-		bp: Rc<Breakpoint>,
-		f: impl FnOnce() -> Result<()>,
-	) -> Result<()> {
-		{
-			let mut data = self.data_mut();
-			data.breakpoints.0.push(bp);
-		}
-
-		let result = self.run_in_state(f);
-
-		{
-			let mut data = self.data_mut();
-			data.breakpoints.0.pop();
-		}
-
-		result
-	}
-
+	/// # Panics
+	/// In case of formatting failure
 	pub fn stringify_err(&self, e: &LocError) -> String {
 		let mut out = String::new();
 		self.settings()
@@ -485,43 +525,40 @@ impl EvaluationState {
 	}
 
 	pub fn manifest(&self, val: Val) -> Result<IStr> {
-		self.run_in_state(|| {
-			push_description_frame(
-				|| "manifestification".to_string(),
-				|| val.manifest(&self.manifest_format()),
-			)
-		})
+		self.push_description(
+			|| "manifestification".to_string(),
+			|| val.manifest(self.clone(), &self.manifest_format()),
+		)
 	}
 	pub fn manifest_multi(&self, val: Val) -> Result<Vec<(IStr, IStr)>> {
-		self.run_in_state(|| val.manifest_multi(&self.manifest_format()))
+		val.manifest_multi(self.clone(), &self.manifest_format())
 	}
 	pub fn manifest_stream(&self, val: Val) -> Result<Vec<IStr>> {
-		self.run_in_state(|| val.manifest_stream(&self.manifest_format()))
+		val.manifest_stream(self.clone(), &self.manifest_format())
 	}
 
 	/// If passed value is function then call with set TLA
 	pub fn with_tla(&self, val: Val) -> Result<Val> {
-		self.run_in_state(|| {
-			Ok(match val {
-				Val::Func(func) => push_description_frame(
-					|| "during TLA call".to_owned(),
-					|| {
-						func.evaluate(
-							self.create_default_context(),
-							None,
-							&self.settings().tla_vars,
-							true,
-						)
-					},
-				)?,
-				v => v,
-			})
+		Ok(match val {
+			Val::Func(func) => self.push_description(
+				|| "during TLA call".to_owned(),
+				|| {
+					func.evaluate(
+						self.clone(),
+						self.create_default_context(),
+						CallLocation::native(),
+						&self.settings().tla_vars,
+						true,
+					)
+				},
+			)?,
+			v => v,
 		})
 	}
 }
 
 /// Internals
-impl EvaluationState {
+impl State {
 	fn data(&self) -> Ref<EvaluationData> {
 		self.0.data.borrow()
 	}
@@ -537,47 +574,56 @@ impl EvaluationState {
 }
 
 /// Raw methods evaluate passed values but don't perform TLA execution
-impl EvaluationState {
-	pub fn evaluate_file_raw(&self, name: &Path) -> Result<Val> {
-		self.run_in_state(|| self.import_file(&std::env::current_dir().expect("cwd"), name))
-	}
-	pub fn evaluate_file_raw_nocwd(&self, name: &Path) -> Result<Val> {
-		self.run_in_state(|| self.import_file(&PathBuf::from("."), name))
-	}
+impl State {
 	/// Parses and evaluates the given snippet
-	pub fn evaluate_snippet_raw(&self, source: Rc<Path>, code: IStr) -> Result<Val> {
-		let parsed = parse(
+	pub fn evaluate_snippet(&self, name: String, code: String) -> Result<Val> {
+		let source = Source::new_virtual(Cow::Owned(name.clone()));
+		let parsed = jrsonnet_parser::parse(
 			&code,
 			&ParserSettings {
 				file_name: source.clone(),
 			},
 		)
 		.map_err(|e| ImportSyntaxError {
-			path: source.clone(),
-			source_code: code.clone(),
+			path: source,
+			source_code: code.clone().into(),
 			error: Box::new(e),
 		})?;
-		self.add_parsed_file(source, code, parsed.clone())?;
-		self.evaluate_expr_raw(parsed)
-	}
-	/// Evaluates the parsed expression
-	pub fn evaluate_expr_raw(&self, code: LocExpr) -> Result<Val> {
-		self.run_in_state(|| evaluate(self.create_default_context(), &code))
+		self.data_mut().volatile_files.insert(name, code);
+		evaluate(self.clone(), self.create_default_context(), &parsed)
 	}
 }
 
 /// Settings utilities
-impl EvaluationState {
+impl State {
 	pub fn add_ext_var(&self, name: IStr, value: Val) {
-		self.settings_mut().ext_vars.insert(name, value);
+		self.settings_mut()
+			.ext_vars
+			.insert(name, TlaArg::Val(value));
 	}
 	pub fn add_ext_str(&self, name: IStr, value: IStr) {
-		self.add_ext_var(name, Val::Str(value));
+		self.settings_mut()
+			.ext_vars
+			.insert(name, TlaArg::String(value));
 	}
-	pub fn add_ext_code(&self, name: IStr, code: IStr) -> Result<()> {
-		let value =
-			self.evaluate_snippet_raw(PathBuf::from(format!("ext_code {}", name)).into(), code)?;
-		self.add_ext_var(name, value);
+	pub fn add_ext_code(&self, name: &str, code: String) -> Result<()> {
+		let source_name = format!("<extvar:{}>", name);
+		let source = Source::new_virtual(Cow::Owned(source_name.clone()));
+		let parsed = jrsonnet_parser::parse(
+			&code,
+			&ParserSettings {
+				file_name: source.clone(),
+			},
+		)
+		.map_err(|e| ImportSyntaxError {
+			path: source,
+			source_code: code.clone().into(),
+			error: Box::new(e),
+		})?;
+		self.data_mut().volatile_files.insert(source_name, code);
+		self.settings_mut()
+			.ext_vars
+			.insert(name.into(), TlaArg::Code(parsed));
 		Ok(())
 	}
 
@@ -591,19 +637,33 @@ impl EvaluationState {
 			.tla_vars
 			.insert(name, TlaArg::String(value));
 	}
-	pub fn add_tla_code(&self, name: IStr, code: IStr) -> Result<()> {
-		let parsed = self.add_file(PathBuf::from(format!("tla_code {}", name)).into(), code)?;
+	pub fn add_tla_code(&self, name: IStr, code: &str) -> Result<()> {
+		let source_name = format!("<top-level-arg:{}>", name);
+		let source = Source::new_virtual(Cow::Owned(source_name.clone()));
+		let parsed = jrsonnet_parser::parse(
+			code,
+			&ParserSettings {
+				file_name: source.clone(),
+			},
+		)
+		.map_err(|e| ImportSyntaxError {
+			path: source,
+			source_code: code.into(),
+			error: Box::new(e),
+		})?;
+		self.data_mut()
+			.volatile_files
+			.insert(source_name, code.to_owned());
 		self.settings_mut()
 			.tla_vars
 			.insert(name, TlaArg::Code(parsed));
 		Ok(())
 	}
 
-	pub fn resolve_file(&self, from: &Path, path: &Path) -> Result<Rc<Path>> {
-		self.settings().import_resolver.resolve_file(from, path)
-	}
-	pub fn load_file_contents(&self, path: &Path) -> Result<IStr> {
-		self.settings().import_resolver.load_file_contents(path)
+	pub fn resolve_file(&self, from: &Path, path: &str) -> Result<PathBuf> {
+		self.settings()
+			.import_resolver
+			.resolve_file(from, path.as_ref())
 	}
 
 	pub fn import_resolver(&self) -> Ref<dyn ImportResolver> {
@@ -643,626 +703,5 @@ impl EvaluationState {
 	}
 	pub fn set_max_stack(&self, trace: usize) {
 		self.settings_mut().max_stack = trace;
-	}
-}
-
-pub fn cc_ptr_eq<T>(a: &Cc<T>, b: &Cc<T>) -> bool {
-	let a = a as &T;
-	let b = b as &T;
-	std::ptr::eq(a, b)
-}
-
-fn weak_raw<T>(a: Weak<T>) -> *const () {
-	unsafe { std::mem::transmute(a) }
-}
-fn weak_ptr_eq<T>(a: Weak<T>, b: Weak<T>) -> bool {
-	std::ptr::eq(weak_raw(a), weak_raw(b))
-}
-
-#[test]
-fn weak_unsafe() {
-	let a = Cc::new(1);
-	let b = Cc::new(2);
-
-	let aw1 = a.clone().downgrade();
-	let aw2 = a.clone().downgrade();
-	let aw3 = a.clone().downgrade();
-
-	let bw = b.clone().downgrade();
-
-	assert!(weak_ptr_eq(aw1, aw2));
-	assert!(!weak_ptr_eq(aw3, bw));
-}
-
-#[cfg(test)]
-pub mod tests {
-	use super::Val;
-	use crate::{
-		error::Error::*, function::BuiltinParam, gc::TraceBox, native::NativeCallbackHandler,
-		primitive_equals, EvaluationState,
-	};
-	use gcmodule::{Cc, Trace};
-	use jrsonnet_interner::IStr;
-	use jrsonnet_parser::*;
-	use std::{
-		path::{Path, PathBuf},
-		rc::Rc,
-	};
-
-	#[test]
-	#[should_panic]
-	fn eval_state_stacktrace() {
-		let state = EvaluationState::default();
-		state.run_in_state(|| {
-			state
-				.push(
-					Some(&ExprLocation(PathBuf::from("test1.jsonnet").into(), 10, 20)),
-					|| "outer".to_owned(),
-					|| {
-						state.push(
-							Some(&ExprLocation(PathBuf::from("test2.jsonnet").into(), 30, 40)),
-							|| "inner".to_owned(),
-							|| Err(RuntimeError("".into()).into()),
-						)?;
-						Ok(Val::Null)
-					},
-				)
-				.unwrap();
-		});
-	}
-
-	#[test]
-	fn eval_state_standard() {
-		let state = EvaluationState::default();
-		state.with_stdlib();
-		assert!(primitive_equals(
-			&state
-				.evaluate_snippet_raw(
-					PathBuf::from("raw.jsonnet").into(),
-					r#"std.assertEqual(std.base64("test"), "dGVzdA==")"#.into()
-				)
-				.unwrap(),
-			&Val::Bool(true),
-		)
-		.unwrap());
-	}
-
-	macro_rules! eval {
-		($str: expr) => {
-			EvaluationState::default()
-				.with_stdlib()
-				.evaluate_snippet_raw(PathBuf::from("raw.jsonnet").into(), $str.into())
-				.unwrap()
-		};
-	}
-	macro_rules! eval_json {
-		($str: expr) => {{
-			let evaluator = EvaluationState::default();
-			evaluator.with_stdlib();
-			evaluator.run_in_state(|| {
-				evaluator
-					.evaluate_snippet_raw(PathBuf::from("raw.jsonnet").into(), $str.into())
-					.unwrap()
-					.to_json(0)
-					.unwrap()
-					.replace("\n", "")
-			})
-		}};
-	}
-
-	/// Asserts given code returns `true`
-	macro_rules! assert_eval {
-		($str: expr) => {
-			assert!(primitive_equals(&eval!($str), &Val::Bool(true)).unwrap())
-		};
-	}
-
-	/// Asserts given code returns `false`
-	macro_rules! assert_eval_neg {
-		($str: expr) => {
-			assert!(primitive_equals(&eval!($str), &Val::Bool(false)).unwrap())
-		};
-	}
-	macro_rules! assert_json {
-		($str: expr, $out: expr) => {
-			assert_eq!(eval_json!($str), $out.replace("\t", ""))
-		};
-	}
-
-	/// Sanity checking, before trusting to another tests
-	#[test]
-	fn equality_operator() {
-		assert_eval!("2 == 2");
-		assert_eval_neg!("2 != 2");
-		assert_eval!("2 != 3");
-		assert_eval_neg!("2 == 3");
-		assert_eval!("'Hello' == 'Hello'");
-		assert_eval_neg!("'Hello' != 'Hello'");
-		assert_eval!("'Hello' != 'World'");
-		assert_eval_neg!("'Hello' == 'World'");
-	}
-
-	#[test]
-	fn math_evaluation() {
-		assert_eval!("2 + 2 * 2 == 6");
-		assert_eval!("3 + (2 + 2 * 2) == 9");
-	}
-
-	#[test]
-	fn string_concat() {
-		assert_eval!("'Hello' + 'World' == 'HelloWorld'");
-		assert_eval!("'Hello' * 3 == 'HelloHelloHello'");
-		assert_eval!("'Hello' + 'World' * 3 == 'HelloWorldWorldWorld'");
-	}
-
-	#[test]
-	fn faster_join() {
-		assert_eval!("std.join([0,0], [[1,2],[3,4],[5,6]]) == [1,2,0,0,3,4,0,0,5,6]");
-		assert_eval!("std.join(',', ['1','2','3','4']) == '1,2,3,4'");
-	}
-
-	#[test]
-	fn function_contexts() {
-		assert_eval!(
-			r#"
-				local k = {
-					t(name = self.h): [self.h, name],
-					h: 3,
-				};
-				local f = {
-					t: k.t(),
-					h: 4,
-				};
-				f.t[0] == f.t[1]
-			"#
-		);
-	}
-
-	#[test]
-	fn local() {
-		assert_eval!("local a = 2; local b = 3; a + b == 5");
-		assert_eval!("local a = 1, b = a + 1; a + b == 3");
-		assert_eval!("local a = 1; local a = 2; a == 2");
-	}
-
-	#[test]
-	fn object_lazyness() {
-		assert_json!("local a = {a:error 'test'}; {}", r#"{}"#);
-	}
-
-	#[test]
-	fn object_inheritance() {
-		assert_json!("{a: self.b} + {b:3}", r#"{"a": 3,"b": 3}"#);
-	}
-
-	#[test]
-	fn object_assertion_success() {
-		eval!("{assert \"a\" in self} + {a:2}");
-	}
-
-	#[test]
-	fn object_assertion_error() {
-		eval!("{assert \"a\" in self}");
-	}
-
-	#[test]
-	fn lazy_args() {
-		eval!("local test(a) = 2; test(error '3')");
-	}
-
-	#[test]
-	#[should_panic]
-	fn tailstrict_args() {
-		eval!("local test(a) = 2; test(error '3') tailstrict");
-	}
-
-	#[test]
-	#[should_panic]
-	fn no_binding_error() {
-		eval!("a");
-	}
-
-	#[test]
-	fn test_object() {
-		assert_json!("{a:2}", r#"{"a": 2}"#);
-		assert_json!("{a:2+2}", r#"{"a": 4}"#);
-		assert_json!("{a:2}+{b:2}", r#"{"a": 2,"b": 2}"#);
-		assert_json!("{b:3}+{b:2}", r#"{"b": 2}"#);
-		assert_json!("{b:3}+{b+:2}", r#"{"b": 5}"#);
-		assert_json!("local test='a'; {[test]:2}", r#"{"a": 2}"#);
-		assert_json!(
-			r#"
-				{
-					name: "Alice",
-					welcome: "Hello " + self.name + "!",
-				}
-			"#,
-			r#"{"name": "Alice","welcome": "Hello Alice!"}"#
-		);
-		assert_json!(
-			r#"
-				{
-					name: "Alice",
-					welcome: "Hello " + self.name + "!",
-				} + {
-					name: "Bob"
-				}
-			"#,
-			r#"{"name": "Bob","welcome": "Hello Bob!"}"#
-		);
-	}
-
-	#[test]
-	fn functions() {
-		assert_json!(r#"local a = function(b, c = 2) b + c; a(2)"#, "4");
-		assert_json!(
-			r#"local a = function(b, c = "Dear") b + c + d, d = "World"; a("Hello")"#,
-			r#""HelloDearWorld""#
-		);
-	}
-
-	#[test]
-	fn local_methods() {
-		assert_json!(r#"local a(b, c = 2) = b + c; a(2)"#, "4");
-		assert_json!(
-			r#"local a(b, c = "Dear") = b + c + d, d = "World"; a("Hello")"#,
-			r#""HelloDearWorld""#
-		);
-	}
-
-	#[test]
-	fn object_locals() {
-		assert_json!(r#"{local a = 3, b: a}"#, r#"{"b": 3}"#);
-		assert_json!(r#"{local a = 3, local c = a, b: c}"#, r#"{"b": 3}"#);
-		assert_json!(
-			r#"{local a = function (b) {[b]:4}, test: a("test")}"#,
-			r#"{"test": {"test": 4}}"#
-		);
-	}
-
-	#[test]
-	fn object_comp() {
-		assert_json!(
-			r#"{local t = "a", ["h"+i+"_"+z]: if "h"+(i-1)+"_"+z in self then t+1 else 0+t for i in [1,2,3] for z in [2,3,4] if z != i}"#,
-			"{\"h1_2\": \"0a\",\"h1_3\": \"0a\",\"h1_4\": \"0a\",\"h2_3\": \"a1\",\"h2_4\": \"a1\",\"h3_2\": \"0a\",\"h3_4\": \"a1\"}"
-		)
-	}
-
-	#[test]
-	fn direct_self() {
-		println!(
-			"{:#?}",
-			eval!(
-				r#"
-					{
-						local me = self,
-						a: 3,
-						b(): me.a,
-					}
-				"#
-			)
-		);
-	}
-
-	#[test]
-	fn indirect_self() {
-		// `self` assigned to `me` was lost when being
-		// referenced from field
-		eval!(
-			r#"{
-				local me = self,
-				a: 3,
-				b: me.a,
-			}.b"#
-		);
-	}
-
-	// We can't trust other tests (And official jsonnet testsuite), if assert is not working correctly
-	#[test]
-	fn std_assert_ok() {
-		eval!("std.assertEqual(4.5 << 2, 16)");
-	}
-
-	#[test]
-	#[should_panic]
-	fn std_assert_failure() {
-		eval!("std.assertEqual(4.5 << 2, 15)");
-	}
-
-	#[test]
-	fn string_is_string() {
-		assert!(primitive_equals(
-			&eval!("local arr = 'hello'; (!std.isArray(arr)) && (!std.isString(arr))"),
-			&Val::Bool(false),
-		)
-		.unwrap());
-	}
-
-	#[test]
-	fn base64_works() {
-		assert_json!(r#"std.base64("test")"#, r#""dGVzdA==""#);
-	}
-
-	#[test]
-	fn utf8_chars() {
-		assert_json!(
-			r#"local c="😎";{c:std.codepoint(c),l:std.length(c)}"#,
-			r#"{"c": 128526,"l": 1}"#
-		)
-	}
-
-	#[test]
-	fn json() {
-		assert_json!(
-			r#"std.manifestJsonEx({a:3, b:4, c:6},"")"#,
-			r#""{\n\"a\": 3,\n\"b\": 4,\n\"c\": 6\n}""#
-		);
-	}
-
-	#[test]
-	fn json_minified() {
-		assert_json!(
-			r#"std.manifestJsonMinified({a:3, b:4, c:6})"#,
-			r#""{\"a\":3,\"b\":4,\"c\":6}""#
-		);
-	}
-
-	#[test]
-	fn parse_json() {
-		assert_json!(
-			r#"std.parseJson('{"a": -1,"b": 1,"c": 3.141,"d": []}')"#,
-			r#"{"a": -1,"b": 1,"c": 3.141,"d": []}"#
-		);
-	}
-
-	#[test]
-	fn test() {
-		assert_json!(
-			r#"[[a, b] for a in [1,2,3] for b in [4,5,6]]"#,
-			"[[1,4],[1,5],[1,6],[2,4],[2,5],[2,6],[3,4],[3,5],[3,6]]"
-		);
-	}
-
-	#[test]
-	fn sjsonnet() {
-		eval!(
-			r#"
-			local x0 = {k: 1};
-			local x1 = {k: x0.k + x0.k};
-			local x2 = {k: x1.k + x1.k};
-			local x3 = {k: x2.k + x2.k};
-			local x4 = {k: x3.k + x3.k};
-			local x5 = {k: x4.k + x4.k};
-			local x6 = {k: x5.k + x5.k};
-			local x7 = {k: x6.k + x6.k};
-			local x8 = {k: x7.k + x7.k};
-			local x9 = {k: x8.k + x8.k};
-			local x10 = {k: x9.k + x9.k};
-			local x11 = {k: x10.k + x10.k};
-			local x12 = {k: x11.k + x11.k};
-			local x13 = {k: x12.k + x12.k};
-			local x14 = {k: x13.k + x13.k};
-			local x15 = {k: x14.k + x14.k};
-			local x16 = {k: x15.k + x15.k};
-			local x17 = {k: x16.k + x16.k};
-			local x18 = {k: x17.k + x17.k};
-			local x19 = {k: x18.k + x18.k};
-			local x20 = {k: x19.k + x19.k};
-			local x21 = {k: x20.k + x20.k};
-			x21.k
-		"#
-		);
-	}
-
-	// This test is commented out by default, because of huge compilation slowdown
-	// #[bench]
-	// fn bench_codegen(b: &mut Bencher) {
-	// 	b.iter(|| {
-	// 		#[allow(clippy::all)]
-	// 		let stdlib = {
-	// 			use jrsonnet_parser::*;
-	// 			include!(concat!(env!("OUT_DIR"), "/stdlib.rs"))
-	// 		};
-	// 		stdlib
-	// 	})
-	// }
-
-	/*
-	#[bench]
-	fn bench_serialize(b: &mut Bencher) {
-		b.iter(|| {
-			bincode::deserialize::<jrsonnet_parser::LocExpr>(include_bytes!(concat!(
-				env!("OUT_DIR"),
-				"/stdlib.bincode"
-			)))
-			.expect("deserialize stdlib")
-		})
-	}
-
-	#[bench]
-	fn bench_parse(b: &mut Bencher) {
-		b.iter(|| {
-			jrsonnet_parser::parse(
-				jrsonnet_stdlib::STDLIB_STR,
-				&jrsonnet_parser::ParserSettings {
-					loc_data: true,
-					file_name: Rc::new(PathBuf::from("std.jsonnet")),
-				},
-			)
-		})
-	}
-	*/
-
-	#[test]
-	fn equality() {
-		println!(
-			"{:?}",
-			jrsonnet_parser::parse(
-				"{ x: 1, y: 2 } == { x: 1, y: 2 }",
-				&ParserSettings {
-					file_name: PathBuf::from("equality").into(),
-				}
-			)
-		);
-		assert_eval!("{ x: 1, y: 2 } == { x: 1, y: 2 }")
-	}
-
-	#[test]
-	fn native_ext() -> crate::error::Result<()> {
-		use super::native::NativeCallback;
-		let evaluator = EvaluationState::default();
-
-		evaluator.with_stdlib();
-
-		#[derive(Trace)]
-		struct NativeAdd;
-		impl NativeCallbackHandler for NativeAdd {
-			fn call(&self, from: Option<Rc<Path>>, args: &[Val]) -> crate::error::Result<Val> {
-				assert_eq!(
-					&from.unwrap() as &Path,
-					&PathBuf::from("native_caller.jsonnet")
-				);
-				match (&args[0], &args[1]) {
-					(Val::Num(a), Val::Num(b)) => Ok(Val::Num(a + b)),
-					(_, _) => unreachable!(),
-				}
-			}
-		}
-		evaluator.settings_mut().ext_natives.insert(
-			"native_add".into(),
-			#[allow(deprecated)]
-			Cc::new(TraceBox(Box::new(NativeCallback::new(
-				vec![
-					BuiltinParam {
-						name: "a".into(),
-						has_default: false,
-					},
-					BuiltinParam {
-						name: "b".into(),
-						has_default: false,
-					},
-				],
-				TraceBox(Box::new(NativeAdd)),
-			)))),
-		);
-		evaluator.evaluate_snippet_raw(
-			PathBuf::from("native_caller.jsonnet").into(),
-			"std.assertEqual(std.native(\"native_add\")(1, 2), 3)".into(),
-		)?;
-		Ok(())
-	}
-
-	#[test]
-	fn constant_intrinsic() -> crate::error::Result<()> {
-		assert_eval!(
-			"local std2 = std; local std = std2 { primitiveEquals(a, b):: false }; 1 == 1"
-		);
-		Ok(())
-	}
-
-	#[test]
-	fn standalone_super() -> crate::error::Result<()> {
-		assert_eval!(
-			r#"
-			local obj = {
-				a: 1,
-				b: 2,
-				c: 3,
-			};
-			local test = obj + {
-				fields: std.objectFields(super),
-				d: 5,
-			};
-			test.fields == ['a', 'b', 'c']
-		"#
-		);
-		Ok(())
-	}
-
-	#[test]
-	fn comp_self() -> crate::error::Result<()> {
-		assert_eval!(
-			r#"
-			std.objectFields({
-				a:{
-					[name]: name for name in std.objectFields(self)
-				},
-				b: 2,
-				c: 3,
-			}.a) == ['a', 'b', 'c']
-			"#
-		);
-
-		Ok(())
-	}
-
-	struct TestImportResolver(IStr);
-	impl crate::import::ImportResolver for TestImportResolver {
-		fn resolve_file(&self, _: &Path, _: &Path) -> crate::error::Result<Rc<Path>> {
-			Ok(PathBuf::from("/test").into())
-		}
-
-		fn load_file_contents(&self, _: &Path) -> crate::error::Result<IStr> {
-			Ok(self.0.clone())
-		}
-
-		unsafe fn as_any(&self) -> &dyn std::any::Any {
-			panic!()
-		}
-	}
-
-	#[test]
-	fn issue_23() {
-		let state = EvaluationState::default();
-		state.set_import_resolver(Box::new(TestImportResolver(r#"import "/test""#.into())));
-		let _ = state.evaluate_file_raw(&PathBuf::from("/test"));
-	}
-
-	#[test]
-	fn issue_40() {
-		let state = EvaluationState::default();
-		state.with_stdlib();
-
-		let error = state
-			.evaluate_snippet_raw(
-				PathBuf::from("issue40.jsonnet").into(),
-				r#"
-				local conf = {
-					n: ""
-				};
-
-				local result = conf + {
-					assert std.isNumber(self.n): "is number"
-				};
-
-				std.manifestJsonEx(result, "")
-			"#
-				.into(),
-			)
-			.unwrap_err();
-		assert_eq!(error.error().to_string(), "assert failed: is number");
-	}
-
-	#[test]
-	fn test_ascii_upper_lower() {
-		assert_eval!(r#"std.assertEqual(std.asciiUpper("aBc😀"), "ABC😀")"#);
-		assert_eval!(r#"std.assertEqual(std.asciiLower("aBc😀"), "abc😀")"#);
-	}
-
-	#[test]
-	fn test_member() {
-		assert_eval!(r#"!std.member("", "")"#);
-		assert_eval!(r#"std.member("abc", "a")"#);
-		assert_eval!(r#"!std.member("abc", "d")"#);
-		assert_eval!(r#"!std.member([], "")"#);
-		assert_eval!(r#"std.member(["a", "b", "c"], "a")"#);
-		assert_eval!(r#"!std.member(["a", "b", "c"], "d")"#);
-	}
-
-	#[test]
-	fn test_count() {
-		assert_eval!(r#"std.assertEqual(std.count([], ""), 0)"#);
-		assert_eval!(r#"std.assertEqual(std.count(["a", "b", "a"], "d"), 0)"#);
-		assert_eval!(r#"std.assertEqual(std.count(["a", "b", "a"], "a"), 2)"#);
 	}
 }

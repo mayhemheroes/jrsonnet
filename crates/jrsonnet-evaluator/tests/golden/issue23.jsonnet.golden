@@ -1,0 +1,2 @@
+infinite recursion detected
+   issue23.jsonnet:1:1-26: import "issue23.jsonnet"

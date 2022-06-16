@@ -1,20 +1,29 @@
 /// Macros to help deal with Gc
 use std::{
 	borrow::{Borrow, BorrowMut},
+	collections::HashSet,
 	hash::BuildHasherDefault,
 	ops::{Deref, DerefMut},
 };
 
-use gcmodule::{Trace, Tracer};
-use rustc_hash::{FxHashMap, FxHashSet};
+use hashbrown::HashMap;
+use jrsonnet_gcmodule::{Trace, Tracer};
+use rustc_hash::{FxHashSet, FxHasher};
 
 /// Replacement for box, which assumes that the underlying type is [`Trace`]
+/// Used in places, where `Cc<dyn Trait>` should be used instead, but it can't, because `CoerceUnsiced` is not stable
 #[derive(Debug, Clone)]
 pub struct TraceBox<T: ?Sized>(pub Box<T>);
+#[macro_export]
+macro_rules! tb {
+	($v:expr) => {
+		$crate::gc::TraceBox(Box::new($v))
+	};
+}
 
 impl<T: ?Sized + Trace> Trace for TraceBox<T> {
 	fn trace(&self, tracer: &mut Tracer) {
-		self.0.trace(tracer)
+		self.0.trace(tracer);
 	}
 
 	fn is_type_tracked() -> bool {
@@ -70,7 +79,7 @@ impl<T: ?Sized> AsMut<T> for TraceBox<T> {
 pub struct GcHashSet<V>(pub FxHashSet<V>);
 impl<V> GcHashSet<V> {
 	pub fn new() -> Self {
-		Self(Default::default())
+		Self(HashSet::default())
 	}
 	pub fn with_capacity(capacity: usize) -> Self {
 		Self(FxHashSet::with_capacity_and_hasher(
@@ -83,7 +92,7 @@ impl<V> Trace for GcHashSet<V>
 where
 	V: Trace,
 {
-	fn trace(&self, tracer: &mut gcmodule::Tracer) {
+	fn trace(&self, tracer: &mut jrsonnet_gcmodule::Tracer) {
 		for v in &self.0 {
 			v.trace(tracer);
 		}
@@ -107,14 +116,13 @@ impl<V> Default for GcHashSet<V> {
 	}
 }
 
-#[derive(Clone)]
-pub struct GcHashMap<K, V>(pub FxHashMap<K, V>);
+pub struct GcHashMap<K, V>(pub HashMap<K, V, BuildHasherDefault<FxHasher>>);
 impl<K, V> GcHashMap<K, V> {
 	pub fn new() -> Self {
-		Self(Default::default())
+		Self(HashMap::default())
 	}
 	pub fn with_capacity(capacity: usize) -> Self {
-		Self(FxHashMap::with_capacity_and_hasher(
+		Self(HashMap::with_capacity_and_hasher(
 			capacity,
 			BuildHasherDefault::default(),
 		))
@@ -125,7 +133,7 @@ where
 	K: Trace,
 	V: Trace,
 {
-	fn trace(&self, tracer: &mut gcmodule::Tracer) {
+	fn trace(&self, tracer: &mut jrsonnet_gcmodule::Tracer) {
 		for (k, v) in &self.0 {
 			k.trace(tracer);
 			v.trace(tracer);
@@ -133,7 +141,7 @@ where
 	}
 }
 impl<K, V> Deref for GcHashMap<K, V> {
-	type Target = FxHashMap<K, V>;
+	type Target = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 
 	fn deref(&self) -> &Self::Target {
 		&self.0

@@ -1,31 +1,17 @@
-use crate::cc_ptr_eq;
-use crate::gc::GcHashMap;
-use crate::{
-	error::Error::*, map::LayeredHashMap, FutureWrapper, LazyBinding, LazyVal, ObjValue, Result,
-	Val,
-};
-use gcmodule::{Cc, Trace};
-use jrsonnet_interner::IStr;
 use std::fmt::Debug;
 
-#[derive(Clone, Trace)]
-pub struct ContextCreator(pub Context, pub FutureWrapper<GcHashMap<IStr, LazyBinding>>);
-impl ContextCreator {
-	pub fn create(&self, this: Option<ObjValue>, super_obj: Option<ObjValue>) -> Result<Context> {
-		self.0.clone().extend_unbound(
-			self.1.clone().unwrap(),
-			self.0.dollar().clone().or_else(|| this.clone()),
-			this,
-			super_obj,
-		)
-	}
-}
+use jrsonnet_gcmodule::{Cc, Trace};
+use jrsonnet_interner::IStr;
+
+use crate::{
+	error::Error::*, gc::GcHashMap, map::LayeredHashMap, ObjValue, Pending, Result, Thunk, Val,
+};
 
 #[derive(Trace)]
 struct ContextInternals {
 	dollar: Option<ObjValue>,
+	sup: Option<ObjValue>,
 	this: Option<ObjValue>,
-	super_obj: Option<ObjValue>,
 	bindings: LayeredHashMap,
 }
 impl Debug for ContextInternals {
@@ -37,8 +23,8 @@ impl Debug for ContextInternals {
 #[derive(Debug, Clone, Trace)]
 pub struct Context(Cc<ContextInternals>);
 impl Context {
-	pub fn new_future() -> FutureWrapper<Self> {
-		FutureWrapper::new()
+	pub fn new_future() -> Pending<Self> {
+		Pending::new()
 	}
 
 	pub fn dollar(&self) -> &Option<ObjValue> {
@@ -50,57 +36,83 @@ impl Context {
 	}
 
 	pub fn super_obj(&self) -> &Option<ObjValue> {
-		&self.0.super_obj
+		&self.0.sup
 	}
 
 	pub fn new() -> Self {
 		Self(Cc::new(ContextInternals {
 			dollar: None,
 			this: None,
-			super_obj: None,
+			sup: None,
 			bindings: LayeredHashMap::default(),
 		}))
 	}
 
-	pub fn binding(&self, name: IStr) -> Result<LazyVal> {
+	#[cfg(not(feature = "friendly-errors"))]
+	pub fn binding(&self, name: IStr) -> Result<Thunk<Val>> {
 		Ok(self
 			.0
 			.bindings
 			.get(&name)
 			.cloned()
-			.ok_or(VariableIsNotDefined(name))?)
+			.ok_or(VariableIsNotDefined(name, vec![]))?)
+	}
+
+	#[cfg(feature = "friendly-errors")]
+	pub fn binding(&self, name: IStr) -> Result<Thunk<Val>> {
+		use std::cmp::Ordering;
+
+		use crate::throw;
+
+		if let Some(val) = self.0.bindings.get(&name).cloned() {
+			return Ok(val);
+		}
+
+		let mut heap = Vec::new();
+		self.0.bindings.clone().iter_keys(|k| {
+			let conf = strsim::jaro_winkler(&k as &str, &name as &str);
+			if conf < 0.8 {
+				return;
+			}
+			heap.push((conf, k));
+		});
+		heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+		throw!(VariableIsNotDefined(
+			name,
+			heap.into_iter().map(|(_, k)| k).collect()
+		))
 	}
 	pub fn contains_binding(&self, name: IStr) -> bool {
 		self.0.bindings.contains_key(&name)
 	}
-	pub fn into_future(self, ctx: FutureWrapper<Self>) -> Self {
+	#[must_use]
+	pub fn into_future(self, ctx: Pending<Self>) -> Self {
 		{
 			ctx.0.borrow_mut().replace(self);
 		}
 		ctx.unwrap()
 	}
 
+	#[must_use]
 	pub fn with_var(self, name: IStr, value: Val) -> Self {
 		let mut new_bindings = GcHashMap::with_capacity(1);
-		new_bindings.insert(name, LazyVal::new_resolved(value));
+		new_bindings.insert(name, Thunk::evaluated(value));
 		self.extend(new_bindings, None, None, None)
 	}
 
-	pub fn with_this_super(self, new_this: ObjValue, new_super_obj: Option<ObjValue>) -> Self {
-		self.extend(GcHashMap::new(), None, Some(new_this), new_super_obj)
-	}
-
+	#[must_use]
 	pub fn extend(
 		self,
-		new_bindings: GcHashMap<IStr, LazyVal>,
+		new_bindings: GcHashMap<IStr, Thunk<Val>>,
 		new_dollar: Option<ObjValue>,
+		new_sup: Option<ObjValue>,
 		new_this: Option<ObjValue>,
-		new_super_obj: Option<ObjValue>,
 	) -> Self {
 		let ctx = &self.0;
 		let dollar = new_dollar.or_else(|| ctx.dollar.clone());
 		let this = new_this.or_else(|| ctx.this.clone());
-		let super_obj = new_super_obj.or_else(|| ctx.super_obj.clone());
+		let sup = new_sup.or_else(|| ctx.sup.clone());
 		let bindings = if new_bindings.is_empty() {
 			ctx.bindings.clone()
 		} else {
@@ -108,30 +120,10 @@ impl Context {
 		};
 		Self(Cc::new(ContextInternals {
 			dollar,
+			sup,
 			this,
-			super_obj,
 			bindings,
 		}))
-	}
-	pub fn extend_bound(self, new_bindings: GcHashMap<IStr, LazyVal>) -> Self {
-		let new_this = self.0.this.clone();
-		let new_super_obj = self.0.super_obj.clone();
-		self.extend(new_bindings, None, new_this, new_super_obj)
-	}
-	pub fn extend_unbound(
-		self,
-		new_bindings: GcHashMap<IStr, LazyBinding>,
-		new_dollar: Option<ObjValue>,
-		new_this: Option<ObjValue>,
-		new_super_obj: Option<ObjValue>,
-	) -> Result<Self> {
-		let this = new_this.or_else(|| self.0.this.clone());
-		let super_obj = new_super_obj.or_else(|| self.0.super_obj.clone());
-		let mut new = GcHashMap::with_capacity(new_bindings.len());
-		for (k, v) in new_bindings.0.into_iter() {
-			new.insert(k, v.evaluate(this.clone(), super_obj.clone())?);
-		}
-		Ok(self.extend(new, new_dollar, this, super_obj))
 	}
 }
 
@@ -143,6 +135,6 @@ impl Default for Context {
 
 impl PartialEq for Context {
 	fn eq(&self, other: &Self) -> bool {
-		cc_ptr_eq(&self.0, &other.0)
+		Cc::ptr_eq(&self.0, &other.0)
 	}
 }

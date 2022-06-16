@@ -2,33 +2,21 @@ use std::{fmt::Display, rc::Rc};
 
 mod conversions;
 pub use conversions::*;
+use jrsonnet_gcmodule::Trace;
+pub use jrsonnet_types::{ComplexValType, ValType};
+use thiserror::Error;
 
 use crate::{
 	error::{Error, LocError, Result},
-	push_description_frame, Val,
+	State, Val,
 };
-use gcmodule::Trace;
-use jrsonnet_types::{ComplexValType, ValType};
-use thiserror::Error;
-
-#[macro_export]
-macro_rules! unwrap_type {
-	($desc:expr, $value:expr, $typ:expr => $match:path) => {{
-		use $crate::{push_frame, typed::CheckType};
-		push_frame(None, $desc, || Ok($typ.check(&$value)?))?;
-		match $value {
-			$match(v) => v,
-			_ => unreachable!(),
-		}
-	}};
-}
 
 #[derive(Debug, Error, Clone, Trace)]
 pub enum TypeError {
 	#[error("expected {0}, got {1}")]
 	ExpectedGot(ComplexValType, ValType),
-	#[error("missing property {0} from {1:?}")]
-	MissingProperty(#[skip_trace] Rc<str>, ComplexValType),
+	#[error("missing property {0} from {1}")]
+	MissingProperty(#[trace(skip)] Rc<str>, ComplexValType),
 	#[error("every failed from {0}:\n{1}")]
 	UnionFailed(ComplexValType, TypeLocErrorList),
 	#[error(
@@ -83,11 +71,11 @@ impl Display for TypeLocErrorList {
 				if line.trim().is_empty() {
 					continue;
 				}
-				if i != 0 {
+				if i == 0 {
+					write!(f, "  - ")?;
+				} else {
 					writeln!(f)?;
 					write!(f, "    ")?;
-				} else {
-					write!(f, "  - ")?;
 				}
 				write!(f, "{}", line)?;
 			}
@@ -97,15 +85,16 @@ impl Display for TypeLocErrorList {
 }
 
 fn push_type_description(
+	s: State,
 	error_reason: impl Fn() -> String,
 	path: impl Fn() -> ValuePathItem,
 	item: impl Fn() -> Result<()>,
 ) -> Result<()> {
-	push_description_frame(error_reason, || match item() {
+	s.push_description(error_reason, || match item() {
 		Ok(_) => Ok(()),
 		Err(mut e) => {
 			if let Error::TypeError(e) = &mut e.error_mut() {
-				(e.1).0.push(path())
+				(e.1).0.push(path());
 			}
 			Err(e)
 		}
@@ -114,11 +103,11 @@ fn push_type_description(
 
 // TODO: check_fast for fast path of union type checking
 pub trait CheckType {
-	fn check(&self, value: &Val) -> Result<()>;
+	fn check(&self, s: State, value: &Val) -> Result<()>;
 }
 
 impl CheckType for ValType {
-	fn check(&self, value: &Val) -> Result<()> {
+	fn check(&self, _: State, value: &Val) -> Result<()> {
 		let got = value.value_type();
 		if got != *self {
 			let loc_error: TypeLocError = TypeError::ExpectedGot((*self).into(), got).into();
@@ -130,13 +119,13 @@ impl CheckType for ValType {
 
 #[derive(Clone, Debug, Trace)]
 enum ValuePathItem {
-	Field(#[skip_trace] Rc<str>),
+	Field(#[trace(skip)] Rc<str>),
 	Index(u64),
 }
 impl Display for ValuePathItem {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			Self::Field(name) => write!(f, ".{}", name)?,
+			Self::Field(name) => write!(f, ".{:?}", name)?,
 			Self::Index(idx) => write!(f, "[{}]", idx)?,
 		}
 		Ok(())
@@ -156,10 +145,11 @@ impl Display for ValuePathStack {
 }
 
 impl CheckType for ComplexValType {
-	fn check(&self, value: &Val) -> Result<()> {
+	#[allow(clippy::too_many_lines)]
+	fn check(&self, s: State, value: &Val) -> Result<()> {
 		match self {
 			Self::Any => Ok(()),
-			Self::Simple(s) => s.check(value),
+			Self::Simple(t) => t.check(s, value),
 			Self::Char => match value {
 				Val::Str(s) if s.len() == 1 || s.chars().count() == 1 => Ok(()),
 				v => Err(TypeError::ExpectedGot(self.clone(), v.value_type()).into()),
@@ -178,11 +168,12 @@ impl CheckType for ComplexValType {
 			}
 			Self::Array(elem_type) => match value {
 				Val::Arr(a) => {
-					for (i, item) in a.iter().enumerate() {
+					for (i, item) in a.iter(s.clone()).enumerate() {
 						push_type_description(
+							s.clone(),
 							|| format!("array index {}", i),
 							|| ValuePathItem::Index(i as u64),
-							|| elem_type.check(&item.clone()?),
+							|| elem_type.check(s.clone(), &item.clone()?),
 						)?;
 					}
 					Ok(())
@@ -191,11 +182,12 @@ impl CheckType for ComplexValType {
 			},
 			Self::ArrayRef(elem_type) => match value {
 				Val::Arr(a) => {
-					for (i, item) in a.iter().enumerate() {
+					for (i, item) in a.iter(s.clone()).enumerate() {
 						push_type_description(
+							s.clone(),
 							|| format!("array index {}", i),
 							|| ValuePathItem::Index(i as u64),
-							|| elem_type.check(&item.clone()?),
+							|| elem_type.check(s.clone(), &item.clone()?),
 						)?;
 					}
 					Ok(())
@@ -205,12 +197,13 @@ impl CheckType for ComplexValType {
 			Self::ObjectRef(elems) => match value {
 				Val::Obj(obj) => {
 					for (k, v) in elems.iter() {
-						if let Some(got_v) = obj.get((*k).into())? {
+						if let Some(got_v) = obj.get(s.clone(), (*k).into())? {
 							push_type_description(
+								s.clone(),
 								|| format!("property {}", k),
 								|| ValuePathItem::Field((*k).into()),
-								|| v.check(&got_v),
-							)?
+								|| v.check(s.clone(), &got_v),
+							)?;
 						} else {
 							return Err(
 								TypeError::MissingProperty((*k).into(), self.clone()).into()
@@ -224,7 +217,7 @@ impl CheckType for ComplexValType {
 			Self::Union(types) => {
 				let mut errors = Vec::new();
 				for ty in types.iter() {
-					match ty.check(value) {
+					match ty.check(s.clone(), value) {
 						Ok(()) => {
 							return Ok(());
 						}
@@ -239,7 +232,7 @@ impl CheckType for ComplexValType {
 			Self::UnionRef(types) => {
 				let mut errors = Vec::new();
 				for ty in types.iter() {
-					match ty.check(value) {
+					match ty.check(s.clone(), value) {
 						Ok(()) => {
 							return Ok(());
 						}
@@ -253,13 +246,13 @@ impl CheckType for ComplexValType {
 			}
 			Self::Sum(types) => {
 				for ty in types.iter() {
-					ty.check(value)?
+					ty.check(s.clone(), value)?;
 				}
 				Ok(())
 			}
 			Self::SumRef(types) => {
 				for ty in types.iter() {
-					ty.check(value)?
+					ty.check(s.clone(), value)?;
 				}
 				Ok(())
 			}

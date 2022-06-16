@@ -1,12 +1,12 @@
 //! faster std.format impl
 #![allow(clippy::too_many_arguments)]
 
-use crate::{error::Error::*, throw, LocError, ObjValue, Result, Val};
-use gcmodule::Trace;
+use jrsonnet_gcmodule::Trace;
 use jrsonnet_interner::IStr;
 use jrsonnet_types::ValType;
-use std::convert::TryFrom;
 use thiserror::Error;
+
+use crate::{error::Error::*, throw, typed::Typed, LocError, ObjValue, Result, State, Val};
 
 #[derive(Debug, Clone, Error, Trace)]
 pub enum FormatError {
@@ -86,6 +86,7 @@ pub mod tests_key {
 	}
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default, Debug)]
 pub struct CFlags {
 	pub alt: bool,
@@ -119,7 +120,7 @@ pub fn try_parse_cflags(str: &str) -> ParseResult<CFlags> {
 	Ok((out, &str[i..]))
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Width {
 	Star,
 	Fixed(usize),
@@ -173,7 +174,7 @@ pub fn try_parse_length_modifier(str: &str) -> ParseResult<()> {
 	Ok(((), &str[idx..]))
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConvTypeV {
 	Decimal,
 	Octal,
@@ -270,12 +271,12 @@ pub fn parse_codes(mut str: &str) -> Result<Vec<Element>> {
 			return Ok(out);
 		}
 		str = &str[offset + 1..];
-		let (code, nstr) = parse_code(str)?;
-		str = nstr;
+		let code;
+		(code, str) = parse_code(str)?;
 		bytes = str.as_bytes();
 		offset = 0;
 
-		out.push(Element::Code(code))
+		out.push(Element::Code(code));
 	}
 }
 
@@ -313,7 +314,7 @@ pub fn render_integer(
 		.saturating_sub(prefix.len() + digits.len());
 
 	if neg {
-		out.push('-')
+		out.push('-');
 	} else if sign {
 		out.push('+');
 	} else if blank {
@@ -340,7 +341,7 @@ pub fn render_decimal(
 	blank: bool,
 	sign: bool,
 ) {
-	render_integer(out, iv, padding, precision, blank, sign, 10, "", false)
+	render_integer(out, iv, padding, precision, blank, sign, 10, "", false);
 }
 pub fn render_octal(
 	out: &mut String,
@@ -361,8 +362,10 @@ pub fn render_octal(
 		8,
 		if alt && iv != 0 { "0" } else { "" },
 		false,
-	)
+	);
 }
+
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn render_hexadecimal(
 	out: &mut String,
 	iv: i64,
@@ -387,9 +390,10 @@ pub fn render_hexadecimal(
 			(false, _) => "",
 		},
 		caps,
-	)
+	);
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn render_float(
 	out: &mut String,
 	n: f64,
@@ -431,6 +435,7 @@ pub fn render_float(
 	}
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 pub fn render_float_sci(
 	out: &mut String,
 	n: f64,
@@ -461,7 +466,9 @@ pub fn render_float_sci(
 	out.push_str(&exponent_str);
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn format_code(
+	s: State,
 	out: &mut String,
 	value: &Val,
 	code: &Code,
@@ -483,9 +490,9 @@ pub fn format_code(
 	let mut tmp_out = String::new();
 
 	match code.convtype {
-		ConvTypeV::String => tmp_out.push_str(&value.clone().to_string()?),
+		ConvTypeV::String => tmp_out.push_str(&value.clone().to_string(s)?),
 		ConvTypeV::Decimal => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			render_decimal(
 				&mut tmp_out,
 				value as i64,
@@ -496,7 +503,7 @@ pub fn format_code(
 			);
 		}
 		ConvTypeV::Octal => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			render_octal(
 				&mut tmp_out,
 				value as i64,
@@ -508,7 +515,7 @@ pub fn format_code(
 			);
 		}
 		ConvTypeV::Hexadecimal => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			render_hexadecimal(
 				&mut tmp_out,
 				value as i64,
@@ -521,7 +528,7 @@ pub fn format_code(
 			);
 		}
 		ConvTypeV::Scientific => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			render_float_sci(
 				&mut tmp_out,
 				value,
@@ -535,7 +542,7 @@ pub fn format_code(
 			);
 		}
 		ConvTypeV::Float => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			render_float(
 				&mut tmp_out,
 				value,
@@ -548,7 +555,7 @@ pub fn format_code(
 			);
 		}
 		ConvTypeV::Shorter => {
-			let value = f64::try_from(value.clone())?;
+			let value = f64::from_untyped(value.clone(), s)?;
 			let exponent = value.log10().floor();
 			if exponent < -4.0 || exponent >= fpprec as f64 {
 				render_float_sci(
@@ -615,7 +622,7 @@ pub fn format_code(
 	Ok(())
 }
 
-pub fn format_arr(str: &str, mut values: &[Val]) -> Result<String> {
+pub fn format_arr(s: State, str: &str, mut values: &[Val]) -> Result<String> {
 	let codes = parse_codes(str)?;
 	let mut out = String::new();
 
@@ -632,7 +639,7 @@ pub fn format_arr(str: &str, mut values: &[Val]) -> Result<String> {
 						}
 						let value = &values[0];
 						values = &values[1..];
-						usize::try_from(value.clone())?
+						usize::from_untyped(value.clone(), s.clone())?
 					}
 					Width::Fixed(n) => n,
 				};
@@ -643,7 +650,7 @@ pub fn format_arr(str: &str, mut values: &[Val]) -> Result<String> {
 						}
 						let value = &values[0];
 						values = &values[1..];
-						Some(usize::try_from(value.clone())?)
+						Some(usize::from_untyped(value.clone(), s.clone())?)
 					}
 					Some(Width::Fixed(n)) => Some(n),
 					None => None,
@@ -661,7 +668,7 @@ pub fn format_arr(str: &str, mut values: &[Val]) -> Result<String> {
 					value
 				};
 
-				format_code(&mut out, value, &c, width, precision)?;
+				format_code(s.clone(), &mut out, value, &c, width, precision)?;
 			}
 		}
 	}
@@ -669,7 +676,7 @@ pub fn format_arr(str: &str, mut values: &[Val]) -> Result<String> {
 	Ok(out)
 }
 
-pub fn format_obj(str: &str, values: &ObjValue) -> Result<String> {
+pub fn format_obj(s: State, str: &str, values: &ObjValue) -> Result<String> {
 	let codes = parse_codes(str)?;
 	let mut out = String::new();
 
@@ -701,14 +708,14 @@ pub fn format_obj(str: &str, values: &ObjValue) -> Result<String> {
 					if f.is_empty() {
 						throw!(MappingKeysRequired);
 					}
-					if let Some(v) = values.get(f.clone())? {
+					if let Some(v) = values.get(s.clone(), f.clone())? {
 						v
 					} else {
 						throw!(NoSuchFormatField(f));
 					}
 				};
 
-				format_code(&mut out, &value, &c, width, precision)?;
+				format_code(s.clone(), &mut out, &value, &c, width, precision)?;
 			}
 		}
 	}
@@ -734,21 +741,51 @@ pub mod test_format {
 
 	#[test]
 	fn octals() {
-		assert_eq!(format_arr("%#o", &[Val::Num(8.0)]).unwrap(), "010");
-		assert_eq!(format_arr("%#4o", &[Val::Num(8.0)]).unwrap(), " 010");
-		assert_eq!(format_arr("%4o", &[Val::Num(8.0)]).unwrap(), "  10");
-		assert_eq!(format_arr("%04o", &[Val::Num(8.0)]).unwrap(), "0010");
-		assert_eq!(format_arr("%+4o", &[Val::Num(8.0)]).unwrap(), " +10");
-		assert_eq!(format_arr("%+04o", &[Val::Num(8.0)]).unwrap(), "+010");
-		assert_eq!(format_arr("%-4o", &[Val::Num(8.0)]).unwrap(), "10  ");
-		assert_eq!(format_arr("%+-4o", &[Val::Num(8.0)]).unwrap(), "+10 ");
-		assert_eq!(format_arr("%+-04o", &[Val::Num(8.0)]).unwrap(), "+10 ");
+		let s = State::default();
+		assert_eq!(
+			format_arr(s.clone(), "%#o", &[Val::Num(8.0)]).unwrap(),
+			"010"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%#4o", &[Val::Num(8.0)]).unwrap(),
+			" 010"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%4o", &[Val::Num(8.0)]).unwrap(),
+			"  10"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%04o", &[Val::Num(8.0)]).unwrap(),
+			"0010"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%+4o", &[Val::Num(8.0)]).unwrap(),
+			" +10"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%+04o", &[Val::Num(8.0)]).unwrap(),
+			"+010"
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%-4o", &[Val::Num(8.0)]).unwrap(),
+			"10  "
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%+-4o", &[Val::Num(8.0)]).unwrap(),
+			"+10 "
+		);
+		assert_eq!(
+			format_arr(s.clone(), "%+-04o", &[Val::Num(8.0)]).unwrap(),
+			"+10 "
+		);
 	}
 
 	#[test]
 	fn percent_doesnt_consumes_values() {
+		let s = State::default();
 		assert_eq!(
 			format_arr(
+				s,
 				"How much error budget is left looking at our %.3f%% availability gurantees?",
 				&[Val::Num(4.0)]
 			)

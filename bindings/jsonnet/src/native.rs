@@ -1,18 +1,16 @@
-use gcmodule::Cc;
-use jrsonnet_evaluator::{
-	error::{Error, LocError},
-	function::BuiltinParam,
-	gc::TraceBox,
-	native::{NativeCallback, NativeCallbackHandler},
-	EvaluationState, IStr, Val,
-};
 use std::{
-	convert::TryFrom,
 	ffi::{c_void, CStr},
 	os::raw::{c_char, c_int},
-	path::Path,
-	rc::Rc,
 };
+
+use jrsonnet_evaluator::{
+	error::{Error, LocError},
+	function::builtin::{BuiltinParam, NativeCallback, NativeCallbackHandler},
+	tb,
+	typed::Typed,
+	IStr, State, Val,
+};
+use jrsonnet_gcmodule::Cc;
 
 type JsonnetNativeCallback = unsafe extern "C" fn(
 	ctx: *const c_void,
@@ -20,15 +18,15 @@ type JsonnetNativeCallback = unsafe extern "C" fn(
 	success: *mut c_int,
 ) -> *mut Val;
 
-#[derive(gcmodule::Trace)]
+#[derive(jrsonnet_gcmodule::Trace)]
 struct JsonnetNativeCallbackHandler {
-	#[skip_trace]
+	#[trace(skip)]
 	ctx: *const c_void,
-	#[skip_trace]
+	#[trace(skip)]
 	cb: JsonnetNativeCallback,
 }
 impl NativeCallbackHandler for JsonnetNativeCallbackHandler {
-	fn call(&self, _from: Option<Rc<Path>>, args: &[Val]) -> Result<Val, LocError> {
+	fn call(&self, s: State, args: &[Val]) -> Result<Val, LocError> {
 		let mut n_args = Vec::new();
 		for a in args {
 			n_args.push(Some(Box::new(a.clone())));
@@ -46,7 +44,7 @@ impl NativeCallbackHandler for JsonnetNativeCallbackHandler {
 		if success == 1 {
 			Ok(v)
 		} else {
-			let e = IStr::try_from(v).expect("error msg");
+			let e = IStr::from_untyped(v, s).expect("error msg");
 			Err(Error::RuntimeError(e).into())
 		}
 	}
@@ -55,7 +53,7 @@ impl NativeCallbackHandler for JsonnetNativeCallbackHandler {
 /// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn jsonnet_native_callback(
-	vm: &EvaluationState,
+	vm: &State,
 	name: *const c_char,
 	cb: JsonnetNativeCallback,
 	ctx: *const c_void,
@@ -78,9 +76,9 @@ pub unsafe extern "C" fn jsonnet_native_callback(
 	vm.add_native(
 		name,
 		#[allow(deprecated)]
-		Cc::new(TraceBox(Box::new(NativeCallback::new(
+		Cc::new(tb!(NativeCallback::new(
 			params,
-			TraceBox(Box::new(JsonnetNativeCallbackHandler { ctx, cb })),
-		)))),
+			tb!(JsonnetNativeCallbackHandler { ctx, cb }),
+		))),
 	)
 }

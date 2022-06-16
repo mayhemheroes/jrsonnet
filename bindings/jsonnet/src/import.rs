@@ -1,9 +1,5 @@
 //! Import resolution manipulation utilities
 
-use jrsonnet_evaluator::{
-	error::{Error::*, Result},
-	throw, EvaluationState, IStr, ImportResolver,
-};
 use std::{
 	any::Any,
 	cell::RefCell,
@@ -14,7 +10,11 @@ use std::{
 	os::raw::{c_char, c_int},
 	path::{Path, PathBuf},
 	ptr::null_mut,
-	rc::Rc,
+};
+
+use jrsonnet_evaluator::{
+	error::{Error::*, Result},
+	throw, ImportResolver, State,
 };
 
 pub type JsonnetImportCallback = unsafe extern "C" fn(
@@ -29,13 +29,12 @@ pub type JsonnetImportCallback = unsafe extern "C" fn(
 pub struct CallbackImportResolver {
 	cb: JsonnetImportCallback,
 	ctx: *mut c_void,
-
-	out: RefCell<HashMap<PathBuf, IStr>>,
+	out: RefCell<HashMap<PathBuf, Vec<u8>>>,
 }
 impl ImportResolver for CallbackImportResolver {
-	fn resolve_file(&self, from: &Path, path: &Path) -> Result<Rc<Path>> {
+	fn resolve_file(&self, from: &Path, path: &str) -> Result<PathBuf> {
 		let base = CString::new(from.to_str().unwrap()).unwrap().into_raw();
-		let rel = CString::new(path.to_str().unwrap()).unwrap().into_raw();
+		let rel = CString::new(path).unwrap().into_raw();
 		let found_here: *mut c_char = null_mut();
 		let mut success: i32 = 0;
 		let result_ptr = unsafe {
@@ -73,11 +72,12 @@ impl ImportResolver for CallbackImportResolver {
 			unsafe { CString::from_raw(result_ptr) };
 		}
 
-		Ok(found_here_buf.into())
+		Ok(found_here_buf)
 	}
-	fn load_file_contents(&self, resolved: &Path) -> Result<IStr> {
+	fn load_file_contents(&self, resolved: &Path) -> Result<Vec<u8>> {
 		Ok(self.out.borrow().get(resolved).unwrap().clone())
 	}
+
 	unsafe fn as_any(&self) -> &dyn Any {
 		self
 	}
@@ -86,7 +86,7 @@ impl ImportResolver for CallbackImportResolver {
 /// # Safety
 #[no_mangle]
 pub unsafe extern "C" fn jsonnet_import_callback(
-	vm: &EvaluationState,
+	vm: &State,
 	cb: JsonnetImportCallback,
 	ctx: *mut c_void,
 ) {
@@ -108,28 +108,28 @@ impl NativeImportResolver {
 	}
 }
 impl ImportResolver for NativeImportResolver {
-	fn resolve_file(&self, from: &Path, path: &Path) -> Result<Rc<Path>> {
+	fn resolve_file(&self, from: &Path, path: &str) -> Result<PathBuf> {
 		let mut new_path = from.to_owned();
 		new_path.push(path);
 		if new_path.exists() {
-			Ok(new_path.into())
+			Ok(new_path)
 		} else {
 			for library_path in self.library_paths.borrow().iter() {
 				let mut cloned = library_path.clone();
 				cloned.push(path);
 				if cloned.exists() {
-					return Ok(cloned.into());
+					return Ok(cloned);
 				}
 			}
 			throw!(ImportFileNotFound(from.to_owned(), path.to_owned()))
 		}
 	}
-	fn load_file_contents(&self, id: &Path) -> Result<IStr> {
+	fn load_file_contents(&self, id: &Path) -> Result<Vec<u8>> {
 		let mut file = File::open(id).map_err(|_e| ResolvedFileNotFound(id.to_owned()))?;
-		let mut out = String::new();
-		file.read_to_string(&mut out)
-			.map_err(|_e| ImportBadFileUtf8(id.to_owned()))?;
-		Ok(out.into())
+		let mut out = Vec::new();
+		file.read_to_end(&mut out)
+			.map_err(|e| ImportIo(e.to_string()))?;
+		Ok(out)
 	}
 	unsafe fn as_any(&self) -> &dyn Any {
 		self
@@ -140,7 +140,7 @@ impl ImportResolver for NativeImportResolver {
 ///
 /// This function is safe, if received v is a pointer to normal C string
 #[no_mangle]
-pub unsafe extern "C" fn jsonnet_jpath_add(vm: &EvaluationState, v: *const c_char) {
+pub unsafe extern "C" fn jsonnet_jpath_add(vm: &State, v: *const c_char) {
 	let cstr = CStr::from_ptr(v);
 	let path = PathBuf::from(cstr.to_str().unwrap());
 	let any_resolver = &vm.settings().import_resolver;

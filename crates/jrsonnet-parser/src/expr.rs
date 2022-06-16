@@ -1,18 +1,17 @@
-use gcmodule::Trace;
-use jrsonnet_interner::IStr;
-#[cfg(feature = "deserialize")]
-use serde::Deserialize;
-#[cfg(feature = "serialize")]
-use serde::Serialize;
 use std::{
-	fmt::{Debug, Display},
+	fmt::{self, Debug, Display},
 	ops::Deref,
-	path::{Path, PathBuf},
 	rc::Rc,
 };
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+use jrsonnet_gcmodule::Trace;
+use jrsonnet_interner::IStr;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+use crate::source::Source;
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub enum FieldName {
 	/// {fixed: 2}
@@ -21,9 +20,8 @@ pub enum FieldName {
 	Dyn(LocExpr),
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Trace)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Trace)]
 pub enum Visibility {
 	/// :
 	Normal,
@@ -39,13 +37,11 @@ impl Visibility {
 	}
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq, Trace)]
 pub struct AssertStmt(pub LocExpr, pub Option<LocExpr>);
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct FieldMember {
 	pub name: FieldName,
@@ -55,8 +51,7 @@ pub struct FieldMember {
 	pub value: LocExpr,
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub enum Member {
 	Field(FieldMember),
@@ -64,9 +59,8 @@ pub enum Member {
 	AssertStmt(AssertStmt),
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Trace)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Trace)]
 pub enum UnaryOpType {
 	Plus,
 	Minus,
@@ -75,7 +69,7 @@ pub enum UnaryOpType {
 }
 
 impl Display for UnaryOpType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		use UnaryOpType::*;
 		write!(
 			f,
@@ -90,9 +84,8 @@ impl Display for UnaryOpType {
 	}
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Trace)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Trace)]
 pub enum BinaryOpType {
 	Mul,
 	Div,
@@ -126,7 +119,7 @@ pub enum BinaryOpType {
 }
 
 impl Display for BinaryOpType {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		use BinaryOpType::*;
 		write!(
 			f,
@@ -157,14 +150,12 @@ impl Display for BinaryOpType {
 }
 
 /// name, default value
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
-pub struct Param(pub IStr, pub Option<LocExpr>);
+pub struct Param(pub Destruct, pub Option<LocExpr>);
 
 /// Defined function parameters
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Trace)]
 pub struct ParamsDesc(pub Rc<Vec<Param>>);
 
@@ -175,8 +166,7 @@ impl Deref for ParamsDesc {
 	}
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct ArgsDesc {
 	pub unnamed: Vec<LocExpr>,
@@ -188,35 +178,74 @@ impl ArgsDesc {
 	}
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Debug, Clone, PartialEq, Trace)]
-pub struct BindSpec {
-	pub name: IStr,
-	pub params: Option<ParamsDesc>,
-	pub value: LocExpr,
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq, Trace)]
+pub enum DestructRest {
+	/// ...rest
+	Keep(IStr),
+	/// ...
+	Drop,
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Trace)]
+pub enum Destruct {
+	Full(IStr),
+	#[cfg(feature = "exp-destruct")]
+	Skip,
+	#[cfg(feature = "exp-destruct")]
+	Array {
+		start: Vec<Destruct>,
+		rest: Option<DestructRest>,
+		end: Vec<Destruct>,
+	},
+	#[cfg(feature = "exp-destruct")]
+	Object {
+		fields: Vec<(IStr, Option<Destruct>, Option<LocExpr>)>,
+		rest: Option<DestructRest>,
+	},
+}
+impl Destruct {
+	/// Name of destructure, used for function parameter names
+	pub fn name(&self) -> Option<IStr> {
+		match self {
+			Self::Full(name) => Some(name.clone()),
+			#[cfg(feature = "exp-destruct")]
+			_ => None,
+		}
+	}
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Trace)]
+pub enum BindSpec {
+	Field {
+		into: Destruct,
+		value: LocExpr,
+	},
+	Function {
+		name: IStr,
+		params: ParamsDesc,
+		value: LocExpr,
+	},
+}
+
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct IfSpecData(pub LocExpr);
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct ForSpecData(pub IStr, pub LocExpr);
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub enum CompSpec {
 	IfSpec(IfSpecData),
 	ForSpec(ForSpecData),
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct ObjComp {
 	pub pre_locals: Vec<BindSpec>,
@@ -227,17 +256,15 @@ pub struct ObjComp {
 	pub compspecs: Vec<CompSpec>,
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub enum ObjBody {
 	MemberList(Vec<Member>),
 	ObjComp(ObjComp),
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Debug, PartialEq, Clone, Copy, Trace)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Trace)]
 pub enum LiteralType {
 	This,
 	Super,
@@ -247,8 +274,7 @@ pub enum LiteralType {
 	False,
 }
 
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub struct SliceDesc {
 	pub start: Option<LocExpr>,
@@ -257,8 +283,7 @@ pub struct SliceDesc {
 }
 
 /// Syntax base
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, PartialEq, Trace)]
 pub enum Expr {
 	Literal(LiteralType),
@@ -303,9 +328,11 @@ pub enum Expr {
 	LocalExpr(Vec<BindSpec>, LocExpr),
 
 	/// import "hello"
-	Import(PathBuf),
+	Import(IStr),
 	/// importStr "file.txt"
-	ImportStr(PathBuf),
+	ImportStr(IStr),
+	/// importBin "file.txt"
+	ImportBin(IStr),
 	/// error "I'm broken"
 	ErrorStmt(LocExpr),
 	/// a(b, c)
@@ -314,6 +341,10 @@ pub enum Expr {
 	Index(LocExpr, LocExpr),
 	/// function(x) x
 	Function(ParamsDesc, LocExpr),
+	/// std.thisFile
+	IntrinsicThisFile,
+	/// std.id,
+	IntrinsicId,
 	/// std.primitiveEquals
 	Intrinsic(IStr),
 	/// if true == false then 1 else 2
@@ -326,31 +357,36 @@ pub enum Expr {
 }
 
 /// file, begin offset, end offset
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
-#[derive(Clone, PartialEq, Trace)]
-#[skip_trace]
-pub struct ExprLocation(pub Rc<Path>, pub usize, pub usize);
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, PartialEq, Eq, Trace)]
+#[trace(skip)]
+#[repr(C)]
+pub struct ExprLocation(pub Source, pub u32, pub u32);
 impl ExprLocation {
 	pub fn belongs_to(&self, other: &ExprLocation) -> bool {
 		other.0 == self.0 && other.1 <= self.1 && other.2 >= self.2
 	}
 }
 
+#[cfg(target_pointer_width = "64")]
+static_assertions::assert_eq_size!(ExprLocation, [u8; 16]);
+
 impl Debug for ExprLocation {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		write!(f, "{:?}:{:?}-{:?}", self.0, self.1, self.2)
 	}
 }
 
 /// Holds AST expression and its location in source file
-#[cfg_attr(feature = "serialize", derive(Serialize))]
-#[cfg_attr(feature = "deserialize", derive(Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, PartialEq, Trace)]
 pub struct LocExpr(pub Rc<Expr>, pub ExprLocation);
 
+#[cfg(target_pointer_width = "64")]
+static_assertions::assert_eq_size!(LocExpr, [u8; 24]);
+
 impl Debug for LocExpr {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		if f.alternate() {
 			write!(f, "{:#?}", self.0)?;
 		} else {

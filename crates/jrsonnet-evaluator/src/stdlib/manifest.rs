@@ -1,9 +1,9 @@
-use crate::error::Error::*;
-use crate::error::Result;
-use crate::push_description_frame;
-use crate::{throw, Val};
+use crate::{
+	error::{Error::*, Result},
+	throw, State, Val,
+};
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ManifestType {
 	// Applied in manifestification
 	Manifest,
@@ -21,14 +21,17 @@ pub struct ManifestJsonOptions<'s> {
 	pub mtype: ManifestType,
 	pub newline: &'s str,
 	pub key_val_sep: &'s str,
+	#[cfg(feature = "exp-preserve-order")]
+	pub preserve_order: bool,
 }
 
-pub fn manifest_json_ex(val: &Val, options: &ManifestJsonOptions<'_>) -> Result<String> {
+pub fn manifest_json_ex(s: State, val: &Val, options: &ManifestJsonOptions<'_>) -> Result<String> {
 	let mut out = String::new();
-	manifest_json_ex_buf(val, &mut out, &mut String::new(), options)?;
+	manifest_json_ex_buf(s, val, &mut out, &mut String::new(), options)?;
 	Ok(out)
 }
 fn manifest_json_ex_buf(
+	s: State,
 	val: &Val,
 	buf: &mut String,
 	cur_padding: &mut String,
@@ -56,7 +59,7 @@ fn manifest_json_ex_buf(
 
 				let old_len = cur_padding.len();
 				cur_padding.push_str(options.padding);
-				for (i, item) in items.iter().enumerate() {
+				for (i, item) in items.iter(s.clone()).enumerate() {
 					if i != 0 {
 						buf.push(',');
 						if mtype == ManifestType::ToString {
@@ -66,7 +69,7 @@ fn manifest_json_ex_buf(
 						}
 					}
 					buf.push_str(cur_padding);
-					manifest_json_ex_buf(&item?, buf, cur_padding, options)?;
+					manifest_json_ex_buf(s.clone(), &item?, buf, cur_padding, options)?;
 				}
 				cur_padding.truncate(old_len);
 
@@ -83,9 +86,12 @@ fn manifest_json_ex_buf(
 			buf.push(']');
 		}
 		Val::Obj(obj) => {
-			obj.run_assertions()?;
+			obj.run_assertions(s.clone())?;
 			buf.push('{');
-			let fields = obj.fields();
+			let fields = obj.fields(
+				#[cfg(feature = "exp-preserve-order")]
+				options.preserve_order,
+			);
 			if !fields.is_empty() {
 				if mtype != ManifestType::ToString && mtype != ManifestType::Minify {
 					buf.push_str(options.newline);
@@ -105,11 +111,11 @@ fn manifest_json_ex_buf(
 					buf.push_str(cur_padding);
 					escape_string_json_buf(&field, buf);
 					buf.push_str(options.key_val_sep);
-					push_description_frame(
+					s.push_description(
 						|| format!("field <{}> manifestification", field.clone()),
 						|| {
-							let value = obj.get(field.clone())?.unwrap();
-							manifest_json_ex_buf(&value, buf, cur_padding, options)?;
+							let value = obj.get(s.clone(), field.clone())?.unwrap();
+							manifest_json_ex_buf(s.clone(), &value, buf, cur_padding, options)?;
 							Ok(Val::Null)
 						},
 					)?;
@@ -152,7 +158,7 @@ fn escape_string_json_buf(s: &str, buf: &mut String) {
 			'\r' => buf.push_str("\\r"),
 			'\t' => buf.push_str("\\t"),
 			c if c < 32 as char || (c >= 127 as char && c <= 159 as char) => {
-				write!(buf, "\\u{:04x}", c as u32).unwrap()
+				write!(buf, "\\u{:04x}", c as u32).unwrap();
 			}
 			c => buf.push(c),
 		}
@@ -182,9 +188,13 @@ pub struct ManifestYamlOptions<'s> {
 	/// safe_key: 1
 	/// ```
 	pub quote_keys: bool,
+	/// If true - then order of fields is preserved as written,
+	/// instead of sorting alphabetically
+	#[cfg(feature = "exp-preserve-order")]
+	pub preserve_order: bool,
 }
 
-/// From https://github.com/chyh1990/yaml-rust/blob/da52a68615f2ecdd6b7e4567019f280c433c1521/src/emitter.rs#L289
+/// From <https://github.com/chyh1990/yaml-rust/blob/da52a68615f2ecdd6b7e4567019f280c433c1521/src/emitter.rs#L289>
 /// With added date check
 fn yaml_needs_quotes(string: &str) -> bool {
 	fn need_quotes_spaces(string: &str) -> bool {
@@ -212,12 +222,15 @@ fn yaml_needs_quotes(string: &str) -> bool {
 		|| string.parse::<f64>().is_ok()
 }
 
-pub fn manifest_yaml_ex(val: &Val, options: &ManifestYamlOptions<'_>) -> Result<String> {
+pub fn manifest_yaml_ex(s: State, val: &Val, options: &ManifestYamlOptions<'_>) -> Result<String> {
 	let mut out = String::new();
-	manifest_yaml_ex_buf(val, &mut out, &mut String::new(), options)?;
+	manifest_yaml_ex_buf(s, val, &mut out, &mut String::new(), options)?;
 	Ok(out)
 }
+
+#[allow(clippy::too_many_lines)]
 fn manifest_yaml_ex_buf(
+	s: State,
 	val: &Val,
 	buf: &mut String,
 	cur_padding: &mut String,
@@ -227,9 +240,9 @@ fn manifest_yaml_ex_buf(
 	match val {
 		Val::Bool(v) => {
 			if *v {
-				buf.push_str("true")
+				buf.push_str("true");
 			} else {
-				buf.push_str("false")
+				buf.push_str("false");
 			}
 		}
 		Val::Null => buf.push_str("null"),
@@ -240,6 +253,7 @@ fn manifest_yaml_ex_buf(
 				buf.push('|');
 				for line in s.split('\n') {
 					buf.push('\n');
+					buf.push_str(cur_padding);
 					buf.push_str(options.padding);
 					buf.push_str(line);
 				}
@@ -254,7 +268,7 @@ fn manifest_yaml_ex_buf(
 			if a.is_empty() {
 				buf.push_str("[]");
 			} else {
-				for (i, item) in a.iter().enumerate() {
+				for (i, item) in a.iter(s.clone()).enumerate() {
 					if i != 0 {
 						buf.push('\n');
 						buf.push_str(cur_padding);
@@ -278,7 +292,7 @@ fn manifest_yaml_ex_buf(
 					if extra_padding {
 						cur_padding.push_str(options.padding);
 					}
-					manifest_yaml_ex_buf(&item, buf, cur_padding, options)?;
+					manifest_yaml_ex_buf(s.clone(), &item, buf, cur_padding, options)?;
 					cur_padding.truncate(prev_len);
 				}
 			}
@@ -287,7 +301,14 @@ fn manifest_yaml_ex_buf(
 			if o.is_empty() {
 				buf.push_str("{}");
 			} else {
-				for (i, key) in o.fields().iter().enumerate() {
+				for (i, key) in o
+					.fields(
+						#[cfg(feature = "exp-preserve-order")]
+						options.preserve_order,
+					)
+					.iter()
+					.enumerate()
+				{
 					if i != 0 {
 						buf.push('\n');
 						buf.push_str(cur_padding);
@@ -299,7 +320,7 @@ fn manifest_yaml_ex_buf(
 					}
 					buf.push(':');
 					let prev_len = cur_padding.len();
-					let item = o.get(key.clone())?.expect("field exists");
+					let item = o.get(s.clone(), key.clone())?.expect("field exists");
 					match &item {
 						Val::Arr(a) if !a.is_empty() => {
 							buf.push('\n');
@@ -315,7 +336,7 @@ fn manifest_yaml_ex_buf(
 						}
 						_ => buf.push(' '),
 					}
-					manifest_yaml_ex_buf(&item, buf, cur_padding, options)?;
+					manifest_yaml_ex_buf(s.clone(), &item, buf, cur_padding, options)?;
 					cur_padding.truncate(prev_len);
 				}
 			}

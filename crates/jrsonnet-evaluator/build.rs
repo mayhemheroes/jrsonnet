@@ -1,18 +1,14 @@
+use std::{borrow::Cow, env, fs::File, io::Write, path::Path};
+
 use bincode::serialize;
-use jrsonnet_parser::{parse, ParserSettings};
+use jrsonnet_parser::{parse, ParserSettings, Source};
 use jrsonnet_stdlib::STDLIB_STR;
-use std::{
-	env,
-	fs::File,
-	io::Write,
-	path::{Path, PathBuf},
-};
 
 fn main() {
 	let parsed = parse(
 		STDLIB_STR,
 		&ParserSettings {
-			file_name: PathBuf::from("std.jsonnet").into(),
+			file_name: Source::new_virtual(Cow::Borrowed("<std>")),
 		},
 	)
 	.expect("parse");
