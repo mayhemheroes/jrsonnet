@@ -113,6 +113,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
+name = "bumpalo"
+version = "3.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37ccbd214614c6783386c1af30caf03192f17891059cecc394b4fb119e363de3"
+
+[[package]]
 name = "cc"
 version = "1.0.73"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,6 +213,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7704b5fdd17b18ae31c4c1da5a2e0305a2bf17b5249300a9ee9ed7b72114c636"
 
 [[package]]
+name = "dprint-core"
+version = "0.58.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d4eb65949e6ff07306d8b85f5b95414d6384a0fd5bb130477a9e0f1dbdc17d6"
+dependencies = [
+ "anyhow",
+ "bumpalo",
+ "indexmap",
+ "rustc-hash",
+ "serde",
+]
+
+[[package]]
 name = "drop_bomb"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -249,12 +268,6 @@ checksum = "78cc372d058dcf6d5ecd98510e7fbc9e5aec4d21de70f65fea8fecebcd881bd4"
 
 [[package]]
 name = "hashbrown"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab5ef0d4909ef3724cc8cce6ccc8572c5c817592e9285f5464f8e86f8bd3726e"
-
-[[package]]
-name = "hashbrown"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db0d4cf898abf0081f964436dc980e96670a0f36863e4b83aaacdb65c9d7ccc3"
@@ -279,12 +292,13 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "1.8.2"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6012d540c5baa3589337a98ce73408de9b5a25ec9fc2c6fd6be8f0d39e0ca5a"
+checksum = "6c6392766afd7964e2531940894cffe4bd8d7d17dbc3c1c4857040fd4b33bdb3"
 dependencies = [
  "autocfg",
- "hashbrown 0.11.2",
+ "hashbrown",
+ "serde",
 ]
 
 [[package]]
@@ -360,7 +374,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
- "hashbrown 0.12.1",
+ "hashbrown",
  "jrsonnet-gcmodule",
  "jrsonnet-interner",
  "jrsonnet-macros",
@@ -376,6 +390,14 @@ dependencies = [
  "static_assertions",
  "strsim",
  "thiserror",
+]
+
+[[package]]
+name = "jrsonnet-fmt"
+version = "0.1.0"
+dependencies = [
+ "dprint-core",
+ "jrsonnet-rowan-parser",
 ]
 
 [[package]]
@@ -403,7 +425,7 @@ dependencies = [
 name = "jrsonnet-interner"
 version = "0.4.2"
 dependencies = [
- "hashbrown 0.12.1",
+ "hashbrown",
  "jrsonnet-gcmodule",
  "rustc-hash",
  "serde",
@@ -439,6 +461,7 @@ dependencies = [
  "drop_bomb",
  "indoc",
  "insta",
+ "jrsonnet-stdlib",
  "logos",
  "miette",
  "rowan",
@@ -747,7 +770,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce1f383129e417a6265b16ed78e6e9307748f0863b2ba75f78ff14717db5b017"
 dependencies = [
  "countme",
- "hashbrown 0.12.1",
+ "hashbrown",
  "memoffset",
  "rustc-hash",
  "text-size",
@@ -1048,6 +1071,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "indexmap",
  "itertools",
  "proc-macro2",
  "quote",
