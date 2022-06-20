@@ -417,13 +417,13 @@ pub fn evaluate(s: State, ctx: Context, expr: &LocExpr) -> Result<Val> {
 		Literal(LiteralType::This) => {
 			Val::Obj(ctx.this().clone().ok_or(CantUseSelfOutsideOfObject)?)
 		}
-		Literal(LiteralType::Super) => Val::Obj(
-			ctx.super_obj().clone().ok_or(NoSuperFound)?.with_this(
+		Literal(LiteralType::Super) => {
+			Val::Obj(ctx.super_obj().clone().ok_or(NoSuperFound)?.with_this(
 				ctx.this()
 					.clone()
 					.expect("if super exists - then this should to"),
-			),
-		),
+			))
+		}
 		Literal(LiteralType::Dollar) => {
 			Val::Obj(ctx.dollar().clone().ok_or(NoTopLevelObjectFound)?)
 		}
