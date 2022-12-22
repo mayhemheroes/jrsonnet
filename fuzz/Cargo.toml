@@ -1,0 +1,25 @@
+[package]
+name = "jrsonnet-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2018"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.jrsonnet-parser]
+path = "../crates/jrsonnet-parser"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "jrsonnet-fuzz"
+path = "fuzz_targets/jrsonnet-fuzz.rs"
+test = false
+doc = false

@@ -1,0 +1,6 @@
+project: jrsonnet
+target: jrsonnet-fuzz
+
+cmds:
+    - cmd: ./jrsonnet-fuzz
+      libfuzzer: true
